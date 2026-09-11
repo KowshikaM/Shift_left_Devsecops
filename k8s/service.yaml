@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devsecops-demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: devsecops-demo
+spec:
+  selector:
+    app: demo-app
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: NodePort

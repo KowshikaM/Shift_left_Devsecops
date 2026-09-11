@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: devsecops-demo
+  labels:
+    app: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      containers:
+        - name: demo-app
+          # REPLACE with your registry path once you push the built image,
+          # e.g. kowshika8/secure-devops-demo:BUILD_TAG
+          image: secure-devops-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          # NOTE: no resources block and no securityContext on purpose -
+          # policy/k8s_security.rego flags both so you can see the gate work.
+          # Hardened version:
+          #
+          # securityContext:
+          #   runAsNonRoot: true
+          #   runAsUser: 1000
+          #   allowPrivilegeEscalation: false
+          #   readOnlyRootFilesystem: true
+          # resources:
+          #   requests:
+          #     cpu: "100m"
+          #     memory: "128Mi"
+          #   limits:
+          #     cpu: "250m"
+          #     memory: "256Mi"

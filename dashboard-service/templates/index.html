@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security Pipeline Dashboard</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="brand">
+      <div class="brand-mark" id="icon-shield"></div>
+      <div>
+        <h1>Security Pipeline Dashboard</h1>
+        <p id="repo-label">Live build history and remediation tickets</p>
+      </div>
+    </div>
+    <div class="meta-row">
+      <span class="meta-item" id="live-indicator">
+        <span class="pulse-dot"></span> Live &mdash; updates every 10s
+      </span>
+    </div>
+  </header>
+
+  <div class="kpi-strip" id="kpi-strip"></div>
+
+  <div class="panel-shell">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="overview">Overview</button>
+      <button class="tab-btn" data-tab="tickets">Tickets<span class="tab-count" id="ticket-count-badge">0</span></button>
+      <button class="tab-btn" data-tab="history">Build history</button>
+      <button class="tab-btn" data-tab="audit">Audit log</button>
+    </div>
+
+    <div class="tab-panel active" id="panel-overview">
+      <div class="section-inner">
+        <h3>Findings trend across recent builds</h3>
+        <div id="trend-chart"></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-tickets">
+      <div id="tickets-list" class="section-inner"></div>
+    </div>
+
+    <div class="tab-panel" id="panel-history">
+      <div id="history-list" class="section-inner"></div>
+    </div>
+
+    <div class="tab-panel" id="panel-audit">
+      <div id="audit-list" class="section-inner"></div>
+    </div>
+  </div>
+
+  <footer>
+    <span>Secure DevOps Pipeline &mdash; persistent build history stored locally</span>
+    <span>Semgrep &middot; Gitleaks &middot; Trivy &middot; OPA/Conftest &middot; OpenAI/Groq</span>
+  </footer>
+
+</div>
+<script src="/static/dashboard.js"></script>
+</body>
+</html>
