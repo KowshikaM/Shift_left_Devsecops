@@ -24,6 +24,33 @@ async function fetchJSON(url, opts) {
   return res.json();
 }
 
+
+async function renderPipelineStatus() {
+  const builds = await fetchJSON("/api/builds");
+  const el = document.getElementById("pipeline-status");
+  if (!builds.length) {
+    el.innerHTML = `<div class="pipeline-empty">Waiting for the first Jenkins pipeline run.</div>`;
+    return;
+  }
+  const b = builds[0];
+  const status = b.pipeline_status || (b.gate_status === "PASS" ? "PASSED" : "FAILED");
+  const gate = b.gate_status || "PENDING";
+  const statusClass = status === "PASSED" ? "status-pass" : (status === "FAILED" ? "status-fail" : "status-running");
+  const gateClass = gate === "PASS" ? "status-pass" : (gate === "FAIL" ? "status-fail" : "status-running");
+  const jenkins = b.jenkins_url ? `<a href="${b.jenkins_url}" target="_blank" rel="noopener">Open Jenkins build</a>` : "";
+  el.innerHTML = `
+    <div class="pipeline-card">
+      <div>
+        <div class="pipeline-eyebrow">Latest pipeline · Build #${b.build_number}</div>
+        <div class="pipeline-stage">${b.current_stage || "Pipeline activity"}</div>
+        <div class="ticket-meta">${b.branch || "main"} · <span class="mono">${(b.commit_sha || "").slice(0, 8)}</span> ${jenkins ? "· " + jenkins : ""}</div>
+      </div>
+      <div class="pipeline-badges">
+        <span class="pipeline-status ${statusClass}">${status}</span>
+        <span class="pipeline-status ${gateClass}">Gate: ${gate}</span>
+      </div>
+    </div>`;
+}
 async function renderKPIs() {
   const builds = await fetchJSON("/api/builds");
   const latest = builds[0];
@@ -160,6 +187,7 @@ async function renderAudit() {
 }
 
 function refreshAll() {
+  renderPipelineStatus();
   renderKPIs();
   renderTrend();
   renderTickets();

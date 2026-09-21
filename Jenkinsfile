@@ -1,5 +1,5 @@
-// Secure DevOps Pipeline — Windows Jenkins agent
-// Required: github-token, dockerhub-creds. Optional AI keys are used only by Jenkinsfile.single-fix.
+// Shift-Left Secure DevOps Pipeline — Windows Jenkins agent
+// Security controls: Semgrep, Gitleaks, Trivy, OPA/Conftest + centralized gate.
 // Dashboard: http://localhost:2001 | Jenkins: http://localhost:8080
 
 pipeline {
@@ -15,6 +15,11 @@ pipeline {
         GITHUB_TOKEN        = credentials('github-token')
         DASHBOARD_URL       = 'http://localhost:2001'
         SCAN_DIR            = '.scan-status'
+        GATE_STATUS         = 'PENDING'
+        PIPELINE_STATUS     = 'RUNNING'
+        PIPELINE_STAGE      = 'Queued'
+        DEPLOYED            = '0'
+        PUBLISH_FINDINGS    = '0'
     }
 
     options {
@@ -26,6 +31,10 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+                script {
+                    env.PIPELINE_STAGE = 'Checkout'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     New-Item -ItemType Directory -Force -Path $env:SCAN_DIR | Out-Null
                     Remove-Item "$env:SCAN_DIR\\*" -Force -ErrorAction SilentlyContinue
@@ -35,6 +44,10 @@ pipeline {
 
         stage('SAST - Semgrep') {
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'SAST - Semgrep'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     & docker run --rm -v "${env:WORKSPACE}:/src" returntocorp/semgrep semgrep scan `
                       --config p/owasp-top-ten --config p/javascript `
@@ -49,6 +62,10 @@ pipeline {
 
         stage('Secret Detection - Gitleaks') {
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Secret Detection - Gitleaks'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     & docker run --rm -v "${env:WORKSPACE}:/repo" zricethezav/gitleaks:latest detect `
                       --source /repo --no-git --report-format json --report-path /repo/gitleaks-results.json
@@ -62,6 +79,10 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Build Docker Image'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     & docker build -t "${env:IMAGE_NAME}:${env:IMAGE_TAG}" .
                     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -71,15 +92,19 @@ pipeline {
 
         stage('Container Scan - Trivy') {
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Container Scan - Trivy'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     & docker save "${env:IMAGE_NAME}:${env:IMAGE_TAG}" -o "${env:WORKSPACE}\\trivy-image.tar"
                     if ($LASTEXITCODE -ne 0) {
-                        Set-Content "$env:SCAN_DIR\\trivy.status" 1
+                        Set-Content "$env:SCAN_DIR\\trivy.status" 2
                         exit 0
                     }
                     & docker run --rm -v "${env:WORKSPACE}:/out" aquasec/trivy:latest image `
                       --input /out/trivy-image.tar --format json --output /out/trivy-results.json `
-                      --severity CRITICAL,HIGH,MEDIUM
+                      --severity CRITICAL,HIGH,MEDIUM --timeout 10m
                     $code = $LASTEXITCODE
                     Set-Content "$env:SCAN_DIR\\trivy.status" $code
                     if (!(Test-Path "trivy-results.json")) { '{}' | Set-Content trivy-results.json }
@@ -91,6 +116,10 @@ pipeline {
 
         stage('Policy Check - OPA/Conftest') {
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Policy Check - OPA/Conftest'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     & docker run --rm -v "${env:WORKSPACE}:/project" openpolicyagent/conftest test `
                       /project/Dockerfile --policy /project/policy --output json | Set-Content dockerfile-policy-results.json
@@ -112,15 +141,27 @@ pipeline {
         stage('Security Gate') {
             steps {
                 script {
+                    env.PIPELINE_STAGE = 'Security Gate'
                     def status = powershell(returnStatus: true, script: 'python scripts/evaluate_gate.py')
-                    currentBuild.result = (status == 0) ? 'SUCCESS' : 'FAILURE'
-                    echo "Security gate result: ${currentBuild.result}"
+                    if (status == 0) {
+                        env.GATE_STATUS = 'PASS'
+                        echo 'Security Gate: PASS'
+                    } else {
+                        env.GATE_STATUS = 'FAIL'
+                        echo 'Security Gate: FAIL'
+                    }
+                    env.PUBLISH_FINDINGS = '1'
+                    powershell 'python scripts/publish_to_dashboard.py'
                 }
             }
         }
 
         stage('Generate Dashboard Report') {
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Generate Dashboard Report'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     $env:REPO_URL = "${env:REPO_URL}"
                     $env:JENKINS_BUILD_URL = "${env:BUILD_URL}"
@@ -128,34 +169,28 @@ pipeline {
                     if (!$env:GIT_COMMIT) { $env:GIT_COMMIT = "local" }
                     python scripts/generate_dashboard.py
                 '''
-                publishHTML(target: [
-                    reportName: 'Security Dashboard',
-                    reportDir: 'dashboard',
-                    reportFiles: 'report.html',
-                    keepAll: true,
-                    alwaysLinkToLastBuild: true,
-                    allowMissing: false
-                ])
                 archiveArtifacts artifacts: 'dashboard/report.html, *-results.json, .scan-status/*.status', allowEmptyArchive: true
             }
         }
 
-        stage('Publish to Live Dashboard') {
-            steps {
-                powershell 'python scripts/publish_to_dashboard.py'
-            }
-        }
-
         stage('Create Remediation Tickets') {
-            when { expression { currentBuild.result == 'FAILURE' } }
+            when { expression { env.GATE_STATUS == 'FAIL' } }
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Create Remediation Tickets'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell 'python scripts/create_remediation_tickets.py'
             }
         }
 
         stage('Push Immutable Image') {
-            when { expression { currentBuild.result == 'SUCCESS' } }
+            when { expression { env.GATE_STATUS == 'PASS' } }
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Push Immutable Image'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
                     usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     powershell '''
@@ -173,8 +208,12 @@ pipeline {
         }
 
         stage('Deploy to kind/minikube') {
-            when { expression { currentBuild.result == 'SUCCESS' } }
+            when { expression { env.GATE_STATUS == 'PASS' } }
             steps {
+                script {
+                    env.PIPELINE_STAGE = 'Deploy to kind/minikube'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
                 powershell '''
                     kubectl config use-context $env:KUBE_CONTEXT
                     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -190,20 +229,45 @@ pipeline {
                 '''
                 script {
                     env.DEPLOYED = '1'
+                    env.PIPELINE_STAGE = 'Deployment Complete'
+                    powershell 'python scripts/publish_to_dashboard.py'
                 }
             }
         }
 
-        stage('Record Deployment') {
-            when { expression { currentBuild.result == 'SUCCESS' && env.DEPLOYED == '1' } }
+        stage('Finalize Pipeline') {
             steps {
-                powershell 'python scripts/publish_to_dashboard.py'
+                script {
+                    if (env.GATE_STATUS == 'PASS') {
+                        env.PIPELINE_STAGE = 'Pipeline Completed Successfully'
+                        env.PIPELINE_STATUS = 'PASSED'
+                        currentBuild.result = 'SUCCESS'
+                    } else {
+                        env.PIPELINE_STAGE = 'Pipeline Blocked by Security Gate'
+                        env.PIPELINE_STATUS = 'FAILED'
+                        currentBuild.result = 'FAILURE'
+                    }
+                    env.PUBLISH_FINDINGS = '1'
+                    powershell 'python scripts/publish_to_dashboard.py'
+                }
             }
         }
     }
 
     post {
-        always { echo "Build result: ${currentBuild.result ?: 'UNKNOWN'}" }
-        failure { echo 'Pipeline blocked or failed. Review the dashboard and Jenkins archived report.' }
+        always {
+            script {
+                if (env.PIPELINE_STATUS == 'RUNNING') {
+                    env.PIPELINE_STATUS = 'FAILED'
+                    env.PIPELINE_STAGE = 'Pipeline Failed'
+                }
+                env.PUBLISH_FINDINGS = '1'
+                powershell 'python scripts/publish_to_dashboard.py'
+                echo "Build result: ${currentBuild.result ?: 'UNKNOWN'}"
+            }
+        }
+        failure {
+            echo 'Pipeline blocked or failed. Review the dashboard and Jenkins archived report.'
+        }
     }
 }

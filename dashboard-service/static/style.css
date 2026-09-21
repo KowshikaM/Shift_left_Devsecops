@@ -93,6 +93,17 @@ tbody tr:hover { background: #FAFBFC; }
 .trend-bar { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; }
 .trend-label { font-size: 0.68rem; color: var(--text-muted); }
 
+.pipeline-status-wrap { margin-bottom: 1rem; }
+.pipeline-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.15rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.pipeline-eyebrow { color: var(--text-muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 650; }
+.pipeline-stage { font-size: 1rem; font-weight: 650; margin: 0.2rem 0; }
+.pipeline-badges { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+.pipeline-status { display: inline-block; padding: 0.25rem 0.65rem; border-radius: 999px; font-size: 0.72rem; font-weight: 700; border: 1px solid; }
+.pipeline-status.status-pass { color: var(--low); background: var(--low-bg); border-color: var(--low); }
+.pipeline-status.status-fail { color: var(--critical); background: var(--critical-bg); border-color: var(--critical); }
+.pipeline-status.status-running { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.pipeline-empty { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.15rem; color: var(--text-muted); font-size: 0.85rem; }
+
 footer { margin-top: 2rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.78rem; color: var(--text-muted); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
 
 @media (max-width: 720px) { .kpi-strip { grid-template-columns: repeat(2, 1fr); } }

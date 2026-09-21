@@ -52,8 +52,26 @@ def close_db(exception=None):
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    with open(SCHEMA_PATH) as f:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
         conn.executescript(f.read())
+
+    # The dashboard uses a persistent SQLite volume. CREATE TABLE IF NOT EXISTS
+    # does not add new columns to an existing table, so apply tiny idempotent
+    # migrations whenever the container starts.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(builds)").fetchall()}
+    migrations = {
+        "pipeline_status": "ALTER TABLE builds ADD COLUMN pipeline_status TEXT NOT NULL DEFAULT 'RUNNING'",
+        "current_stage": "ALTER TABLE builds ADD COLUMN current_stage TEXT",
+        "jenkins_url": "ALTER TABLE builds ADD COLUMN jenkins_url TEXT",
+        "updated_at": "ALTER TABLE builds ADD COLUMN updated_at TEXT",
+    }
+    for column, statement in migrations.items():
+        if column not in columns:
+            conn.execute(statement)
+
+    if "updated_at" not in columns:
+        conn.execute("UPDATE builds SET updated_at = COALESCE(created_at, datetime('now')) WHERE updated_at IS NULL")
+
     conn.commit()
     conn.close()
 
@@ -75,59 +93,73 @@ def create_build():
     payload = request.get_json(force=True)
 
     db = get_db()
-    findings = payload.get("findings", [])
+    findings = payload.get("findings", []) or []
+    findings_complete = bool(payload.get("findings_complete", False))
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    for f in findings:
-        sev = f.get("severity", "LOW").upper()
+    for finding in findings:
+        sev = str(finding.get("severity", "LOW")).upper()
         if sev in counts:
             counts[sev] += 1
 
+    build_number = payload.get("build_number", "unknown")
+    commit_sha = payload.get("commit_sha", "")
     existing = db.execute(
-        """SELECT id FROM builds WHERE build_number = ? AND commit_sha = ? LIMIT 1""",
-        (payload.get("build_number", "unknown"), payload.get("commit_sha", "")),
+        "SELECT id FROM builds WHERE build_number = ? AND commit_sha = ? LIMIT 1",
+        (build_number, commit_sha),
     ).fetchone()
+
+    now = datetime.utcnow().isoformat()
+    gate_status = payload.get("gate_status", "PENDING")
+    pipeline_status = payload.get("pipeline_status", "RUNNING")
+    current_stage = payload.get("current_stage", "")
+    jenkins_url = payload.get("jenkins_url", "")
+    deployed = 1 if payload.get("deployed") else 0
 
     if existing:
         build_id = existing["id"]
         db.execute(
-            """UPDATE builds SET branch=?, triggered_by=?, gate_status=?,
-               critical_count=?, high_count=?, medium_count=?, low_count=?,
-               total_count=?, deployed=? WHERE id=?""",
-            (payload.get("branch","main"), payload.get("triggered_by","unknown"),
-             payload.get("gate_status","FAIL"), counts["CRITICAL"], counts["HIGH"],
-             counts["MEDIUM"], counts["LOW"], len(findings),
-             1 if payload.get("deployed") else 0, build_id)
+            """UPDATE builds SET branch=?, triggered_by=?, gate_status=?, pipeline_status=?,
+               current_stage=?, jenkins_url=?, critical_count=?, high_count=?, medium_count=?,
+               low_count=?, total_count=?, deployed=?, updated_at=? WHERE id=?""",
+            (payload.get("branch", "main"), payload.get("triggered_by", "unknown"),
+             gate_status, pipeline_status, current_stage, jenkins_url,
+             counts["CRITICAL"], counts["HIGH"], counts["MEDIUM"], counts["LOW"],
+             len(findings), deployed, now, build_id),
         )
-        db.execute("DELETE FROM findings WHERE build_id = ?", (build_id,))
+        if findings_complete:
+            db.execute("DELETE FROM findings WHERE build_id = ?", (build_id,))
     else:
         cur = db.execute(
             """INSERT INTO builds
-               (build_number, commit_sha, branch, triggered_by, gate_status,
-                critical_count, high_count, medium_count, low_count, total_count, deployed)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (payload.get("build_number","unknown"), payload.get("commit_sha",""),
-             payload.get("branch","main"), payload.get("triggered_by","unknown"),
-             payload.get("gate_status","FAIL"), counts["CRITICAL"], counts["HIGH"],
-             counts["MEDIUM"], counts["LOW"], len(findings),
-             1 if payload.get("deployed") else 0)
+               (build_number, commit_sha, branch, triggered_by, gate_status, pipeline_status,
+                current_stage, jenkins_url, critical_count, high_count, medium_count, low_count,
+                total_count, deployed, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (build_number, commit_sha, payload.get("branch", "main"),
+             payload.get("triggered_by", "unknown"), gate_status, pipeline_status,
+             current_stage, jenkins_url, counts["CRITICAL"], counts["HIGH"],
+             counts["MEDIUM"], counts["LOW"], len(findings), deployed, now, now),
         )
         build_id = cur.lastrowid
 
-    for f in findings:
-        db.execute(
-            """INSERT INTO findings
-               (build_id, source, severity, file_path, rule_id, message, fixed_version, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open')""",
-            (
-                build_id, f.get("source", ""), f.get("severity", "LOW"),
-                f.get("file_path", ""), f.get("rule_id", ""),
-                f.get("message", ""), f.get("fixed_version", "-"),
-            ),
-        )
-    db.commit()
+    # Stage updates only change pipeline metadata. The final/gate publication
+    # sends findings_complete=true so the finding list is replaced atomically.
+    if findings_complete:
+        for finding in findings:
+            db.execute(
+                """INSERT INTO findings
+                   (build_id, source, severity, file_path, rule_id, message, fixed_version, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open')""",
+                (build_id, finding.get("source", ""), finding.get("severity", "LOW"),
+                 finding.get("file_path", ""), finding.get("rule_id", ""),
+                 finding.get("message", ""), finding.get("fixed_version", "-")),
+            )
 
-    log_event(build_id, None, "build_ingested",
-              f"Gate: {payload.get('gate_status')}, {len(findings)} finding(s)")
+    db.commit()
+    log_event(
+        build_id, None, "pipeline_update",
+        f"Stage: {current_stage or 'unknown'}, Status: {pipeline_status}, Gate: {gate_status}, Findings: {len(findings)}"
+    )
 
     return jsonify({"status": "ok", "build_id": build_id}), 201
 
