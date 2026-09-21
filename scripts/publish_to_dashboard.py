@@ -71,12 +71,21 @@ def collect_findings():
 
 
 def read_gate_status():
-    value = os.environ.get("GATE_STATUS")
-    if value:
-        return value
+    # gate-status.txt is the authoritative result produced by Security Gate.
     if os.path.exists("gate-status.txt"):
-        with open("gate-status.txt", encoding="utf-8") as f:
-            return f.read().strip()
+        try:
+            with open("gate-status.txt", encoding="utf-8") as f:
+                value = f.read().strip().upper()
+            if value in ("PASS", "FAIL"):
+                return value
+        except OSError:
+            pass
+
+    # Fall back to Jenkins environment variable.
+    value = os.environ.get("GATE_STATUS", "").strip().upper()
+    if value in ("PASS", "FAIL"):
+        return value
+
     return "PENDING"
 
 
