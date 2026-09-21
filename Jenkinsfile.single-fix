@@ -19,8 +19,11 @@ pipeline {
     }
 
     stages {
+
         stage('Checkout') {
-            steps { checkout scm }
+            steps {
+                checkout scm
+            }
         }
 
         stage('AI Generate Patch') {
@@ -35,7 +38,10 @@ pipeline {
                           --rule "$env:RULE_ID" `
                           --message "$env:MESSAGE" `
                           --ticket-id "$env:TICKET_ID"
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+                        if ($LASTEXITCODE -ne 0) {
+                            exit $LASTEXITCODE
+                        }
                     '''
                 }
             }
@@ -44,12 +50,25 @@ pipeline {
         stage('Validate AI Patch — Semgrep') {
             steps {
                 powershell '''
-                    docker run --rm -v "${env:WORKSPACE}:/src" returntocorp/semgrep semgrep scan `
-                      --config p/owasp-top-ten --config p/javascript `
-                      --json --output /src/semgrep-results.json /src/app
+                    docker run --rm `
+                      -v "${env:WORKSPACE}:/src" `
+                      returntocorp/semgrep `
+                      semgrep scan `
+                      --config p/owasp-top-ten `
+                      --config p/javascript `
+                      --json `
+                      --output /src/semgrep-results.json `
+                      /src/app
+
                     $code = $LASTEXITCODE
-                    if (!(Test-Path "semgrep-results.json")) { '{}' | Set-Content semgrep-results.json }
-                    if ($code -ge 2) { exit $code }
+
+                    if (!(Test-Path "semgrep-results.json")) {
+                        '{}' | Set-Content semgrep-results.json
+                    }
+
+                    if ($code -ge 2) {
+                        exit $code
+                    }
                 '''
             }
         }
@@ -57,11 +76,24 @@ pipeline {
         stage('Validate AI Patch — Gitleaks') {
             steps {
                 powershell '''
-                    docker run --rm -v "${env:WORKSPACE}:/repo" zricethezav/gitleaks:latest detect `
-                      --source /repo --no-git --report-format json --report-path /repo/gitleaks-results.json
+                    docker run --rm `
+                      -v "${env:WORKSPACE}:/repo" `
+                      zricethezav/gitleaks:latest `
+                      detect `
+                      --source /repo `
+                      --no-git `
+                      --report-format json `
+                      --report-path /repo/gitleaks-results.json
+
                     $code = $LASTEXITCODE
-                    if (!(Test-Path "gitleaks-results.json")) { '[]' | Set-Content gitleaks-results.json }
-                    if ($code -ge 2) { exit $code }
+
+                    if (!(Test-Path "gitleaks-results.json")) {
+                        '[]' | Set-Content gitleaks-results.json
+                    }
+
+                    if ($code -ge 2) {
+                        exit $code
+                    }
                 '''
             }
         }
@@ -70,29 +102,73 @@ pipeline {
             steps {
                 powershell '''
                     docker build -t "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" .
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-                    docker save "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" -o "${env:WORKSPACE}\trivy-image.tar"
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    if ($LASTEXITCODE -ne 0) {
+                        exit $LASTEXITCODE
+                    }
 
-                    docker run --rm -v "${env:WORKSPACE}:/out" aquasec/trivy:latest image `
-                      --input /out/trivy-image.tar --format json --output /out/trivy-results.json `
-                      --severity CRITICAL,HIGH,MEDIUM
+                    docker save `
+                      "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" `
+                      -o "${env:WORKSPACE}\trivy-image.tar"
+
+                    if ($LASTEXITCODE -ne 0) {
+                        exit $LASTEXITCODE
+                    }
+
+                    docker run --rm `
+                      -v "${env:WORKSPACE}:/out" `
+                      aquasec/trivy:latest `
+                      image `
+                      --input /out/trivy-image.tar `
+                      --format json `
+                      --output /out/trivy-results.json `
+                      --severity CRITICAL,HIGH,MEDIUM `
+                      --timeout 10m
+
                     $trivyCode = $LASTEXITCODE
-                    if (!(Test-Path "trivy-results.json")) { '{}' | Set-Content trivy-results.json }
-                    if ($trivyCode -ge 2) { exit $trivyCode }
 
-                    docker run --rm -v "${env:WORKSPACE}:/project" openpolicyagent/conftest test `
-                      /project/Dockerfile --policy /project/policy --output json | Set-Content dockerfile-policy-results.json
+                    if (!(Test-Path "trivy-results.json")) {
+                        '{}' | Set-Content trivy-results.json
+                    }
+
+                    if ($trivyCode -ge 2) {
+                        exit $trivyCode
+                    }
+
+                    docker run --rm `
+                      -v "${env:WORKSPACE}:/project" `
+                      openpolicyagent/conftest `
+                      test `
+                      /project/Dockerfile `
+                      --policy /project/policy `
+                      --output json |
+                      Set-Content dockerfile-policy-results.json
+
                     $d = $LASTEXITCODE
 
-                    docker run --rm -v "${env:WORKSPACE}:/project" openpolicyagent/conftest test `
-                      /project/k8s/deployment.yaml --policy /project/policy --output json | Set-Content k8s-policy-results.json
+                    docker run --rm `
+                      -v "${env:WORKSPACE}:/project" `
+                      openpolicyagent/conftest `
+                      test `
+                      /project/k8s/deployment.yaml `
+                      --policy /project/policy `
+                      --output json |
+                      Set-Content k8s-policy-results.json
+
                     $k = $LASTEXITCODE
 
-                    if (!(Test-Path "dockerfile-policy-results.json")) { '[]' | Set-Content dockerfile-policy-results.json }
-                    if (!(Test-Path "k8s-policy-results.json")) { '[]' | Set-Content k8s-policy-results.json }
-                    if ($d -ge 2 -or $k -ge 2) { exit 2 }
+                    if (!(Test-Path "dockerfile-policy-results.json")) {
+                        '[]' | Set-Content dockerfile-policy-results.json
+                    }
+
+                    if (!(Test-Path "k8s-policy-results.json")) {
+                        '[]' | Set-Content k8s-policy-results.json
+                    }
+
+                    if ($d -ge 2 -or $k -ge 2) {
+                        exit 2
+                    }
+
                     Remove-Item "trivy-image.tar" -Force -ErrorAction SilentlyContinue
                 '''
             }
@@ -102,40 +178,72 @@ pipeline {
             steps {
                 powershell '''
                     New-Item -ItemType Directory -Force -Path .scan-status | Out-Null
+
                     '0' | Set-Content .scan-status/semgrep.status
                     '0' | Set-Content .scan-status/gitleaks.status
                     '0' | Set-Content .scan-status/trivy.status
                     '0' | Set-Content .scan-status/docker-policy.status
                     '0' | Set-Content .scan-status/k8s-policy.status
+
                     python scripts/evaluate_gate.py
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+                    if ($LASTEXITCODE -ne 0) {
+                        exit $LASTEXITCODE
+                    }
                 '''
             }
         }
 
         stage('Create Validated Branch and PR') {
             steps {
-                powershell '''
-                    $result = Get-Content .ai-fix-result.json | ConvertFrom-Json
-                    $branch = "ai-fix-ticket-$env:TICKET_ID-$($env:GIT_COMMIT.Substring(0,8))"
-                    git config user.name "security-bot"
-                    git config user.email "security-bot@users.noreply.github.com"
-                    git checkout -b $branch
-                    git add -- $env:FILE_PATH
-                    git commit -m "fix: AI remediation for ticket #$env:TICKET_ID"
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                    git push -u origin $branch
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                    "AI_BRANCH=$branch" | Out-File -FilePath ai-pr.env -Encoding ascii
-                    "AI_EXPLANATION=$($result.explanation)" | Add-Content ai-pr.env
-                    "AI_PROVIDER=$($result.provider)" | Add-Content ai-pr.env
-                '''
+                withCredentials([
+                    string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')
+                ]) {
+                    powershell '''
+                        $result = Get-Content .ai-fix-result.json | ConvertFrom-Json
+
+                        $branch = "ai-fix-ticket-$env:TICKET_ID-$($env:GIT_COMMIT.Substring(0,8))"
+
+                        git config user.name "security-bot"
+                        git config user.email "security-bot@users.noreply.github.com"
+
+                        git checkout -b $branch
+
+                        git add -- $env:FILE_PATH
+
+                        git commit -m "fix: AI remediation for ticket #$env:TICKET_ID"
+
+                        if ($LASTEXITCODE -ne 0) {
+                            exit $LASTEXITCODE
+                        }
+
+                        # Use the Jenkins GitHub token explicitly for the push.
+                        git -c "http.extraheader=AUTHORIZATION: bearer $env:GITHUB_TOKEN" `
+                            push -u origin $branch
+
+                        if ($LASTEXITCODE -ne 0) {
+                            exit $LASTEXITCODE
+                        }
+
+                        "AI_BRANCH=$branch" |
+                            Out-File -FilePath ai-pr.env -Encoding ascii
+
+                        "AI_EXPLANATION=$($result.explanation)" |
+                            Add-Content ai-pr.env
+
+                        "AI_PROVIDER=$($result.provider)" |
+                            Add-Content ai-pr.env
+                    '''
+                }
+
                 script {
                     def vars = readFile('ai-pr.env').readLines()
+
                     vars.each { line ->
                         def i = line.indexOf('=')
+
                         if (i > 0) {
-                            env[line.substring(0,i)] = line.substring(i+1)
+                            env[line.substring(0, i)] = line.substring(i + 1)
                         }
                     }
                 }
@@ -144,10 +252,15 @@ pipeline {
 
         stage('Open GitHub PR') {
             steps {
-                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                withCredentials([
+                    string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')
+                ]) {
                     powershell '''
                         python scripts/create_ai_pr.py
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+                        if ($LASTEXITCODE -ne 0) {
+                            exit $LASTEXITCODE
+                        }
                     '''
                 }
             }
