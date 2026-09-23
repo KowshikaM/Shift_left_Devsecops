@@ -10,6 +10,7 @@ import json
 import os
 import re
 import urllib.request
+import urllib.error
 
 
 OPENAI_URL = "https://api.openai.com/v1/responses"
@@ -74,8 +75,14 @@ def call_provider(url, key, model, prompt):
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", f"Bearer {key}")
 
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        data = json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {e.code}: {body}"
+        ) from e
 
     text = extract_output(data).strip()
 
