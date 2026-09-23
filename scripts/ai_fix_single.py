@@ -24,7 +24,7 @@ def normalize_path(path):
     p = path.replace("\\", "/").strip()
 
     # Scanner/container mount prefixes.
-    for prefix in ("/src/", "/project/"):
+    for prefix in ("/src/", "/project/", "/repo/"):
         if p.startswith(prefix):
             p = p[len(prefix):]
             break
