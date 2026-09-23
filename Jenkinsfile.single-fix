@@ -33,6 +33,10 @@ pipeline {
                     string(credentialsId: 'groq-api-key', variable: 'GROQ_API_KEY')
                 ]) {
                     powershell '''
+                        Write-Host "Groq key loaded: $([string]::IsNullOrEmpty($env:GROQ_API_KEY) -eq $false)"
+                        Write-Host "Groq key length: $($env:GROQ_API_KEY.Length)"
+                        Write-Host "Groq key prefix: $($env:GROQ_API_KEY.Substring(0,4))"
+
                         python scripts/ai_fix_single.py `
                           --file "$env:FILE_PATH" `
                           --rule "$env:RULE_ID" `
