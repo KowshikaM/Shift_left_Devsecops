@@ -13,6 +13,27 @@ Security rules:
 - AI must return structured JSON containing the complete corrected file.
 - Groq requests use an explicit User-Agent to avoid HTTP 403 / error 1010
   caused by client/network filtering.
+
+Provider transport:
+- Both OpenAI and Groq are called through the plain Chat Completions API
+  (POST /v1/chat/completions), NOT the Responses API.
+
+  The Responses API returns the model's answer inside a variable, nested
+  "output" array that can contain reasoning blocks, tool-call blocks, and
+  message blocks in any order. Reliably picking the right nested field out
+  of that array is what caused the repeated "no usable text output" /
+  "invalid JSON" failures. Chat Completions always puts the answer in
+  exactly one place: choices[0].message.content.
+
+- Structured Outputs (response_format: json_schema, strict mode) is used
+  so the provider is constrained to return ONLY a JSON object matching
+  our schema -- no markdown fences, no explanatory prose, no reasoning
+  text mixed into the answer. This is supported by both OpenAI and Groq
+  (Groq: openai/gpt-oss-20b and openai/gpt-oss-120b support strict mode).
+
+- parse_ai_json() is kept as a defensive fallback for any provider/model
+  that does not honor response_format, so the script degrades gracefully
+  instead of hard-failing.
 """
 
 import argparse
@@ -27,15 +48,44 @@ import urllib.request
 # API configuration
 # ---------------------------------------------------------------------------
 
-OPENAI_URL = "https://api.openai.com/v1/responses"
-GROQ_URL = "https://api.groq.com/openai/v1/responses"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
 REQUEST_TIMEOUT = 90
 
+# Generous enough for a full Dockerfile / k8s manifest / app source file,
+# without setting it so high that a stalled generation ties up the build.
+MAX_OUTPUT_TOKENS = 8000
+
 USER_AGENT = "ShiftLeftDevSecOps/1.0"
+
+SYSTEM_PROMPT = (
+    "You are a precise security remediation engine. You always respond "
+    "with a single JSON object that matches the provided schema exactly. "
+    "You never include markdown, code fences, or any text outside the "
+    "JSON object."
+)
+
+# JSON Schema the model's answer must conform to. Used with Structured
+# Outputs (strict mode where the provider supports it).
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "explanation": {
+            "type": "string",
+            "description": "2-3 concise sentences explaining the security fix.",
+        },
+        "fixed_file_content": {
+            "type": "string",
+            "description": "The FULL corrected file content, nothing omitted.",
+        },
+    },
+    "required": ["explanation", "fixed_file_content"],
+    "additionalProperties": False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -94,128 +144,10 @@ def safe_path(path):
 # AI response handling
 # ---------------------------------------------------------------------------
 
-def extract_output(data):
-    """
-    Extract generated text from an OpenAI-compatible Responses API response.
-
-    Supports:
-    - output_text
-    - output[].content[].text
-    - output[].content[].output_text
-    - output[].content[].text.value
-    - nested dictionaries/lists containing text
-    """
-
-    if not isinstance(data, dict):
-        raise RuntimeError("AI provider returned an invalid response object")
-
-    # ---------------------------------------------------------------
-    # 1. Standard Responses API convenience field
-    # ---------------------------------------------------------------
-
-    output_text = data.get("output_text")
-
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
-    # ---------------------------------------------------------------
-    # 2. Standard Responses API output array
-    # ---------------------------------------------------------------
-
-    parts = []
-
-    for item in data.get("output", []) or []:
-        if not isinstance(item, dict):
-            continue
-
-        # Some providers expose text directly on the output item.
-        direct_text = item.get("text")
-
-        if isinstance(direct_text, str) and direct_text.strip():
-            parts.append(direct_text)
-
-        # Normal Responses API structure:
-        # output -> content -> text
-        for content in item.get("content", []) or []:
-            if not isinstance(content, dict):
-                continue
-
-            text = content.get("text")
-
-            if isinstance(text, str) and text.strip():
-                parts.append(text)
-                continue
-
-            output_text_value = content.get("output_text")
-
-            if isinstance(output_text_value, str) and output_text_value.strip():
-                parts.append(output_text_value)
-                continue
-
-            # Some OpenAI-compatible providers may return:
-            # {"text": {"value": "..."}}
-            if isinstance(text, dict):
-                value = text.get("value")
-
-                if isinstance(value, str) and value.strip():
-                    parts.append(value)
-
-    result = "\n".join(parts).strip()
-
-    if result:
-        return result
-
-    # ---------------------------------------------------------------
-    # 3. Recursive fallback for OpenAI-compatible response variants
-    # ---------------------------------------------------------------
-
-    def find_text(value):
-        if isinstance(value, dict):
-            # Prefer explicit text fields.
-            for key in ("output_text", "text"):
-                candidate = value.get(key)
-
-                if isinstance(candidate, str) and candidate.strip():
-                    return candidate.strip()
-
-                if isinstance(candidate, dict):
-                    nested = find_text(candidate)
-
-                    if nested:
-                        return nested
-
-            for child in value.values():
-                nested = find_text(child)
-
-                if nested:
-                    return nested
-
-        elif isinstance(value, list):
-            for child in value:
-                nested = find_text(child)
-
-                if nested:
-                    return nested
-
-        return None
-
-    fallback = find_text(data)
-
-    if fallback:
-        return fallback
-
-    # ---------------------------------------------------------------
-    # Nothing usable found
-    # ---------------------------------------------------------------
-
-    raise RuntimeError(
-        "AI provider returned no usable text output"
-    )
-
-
 def clean_json_response(text):
     """
     Remove accidental Markdown JSON code fences and surrounding whitespace.
+    Only used as a fallback when structured output wasn't honored.
     """
 
     if not isinstance(text, str):
@@ -223,26 +155,9 @@ def clean_json_response(text):
 
     text = text.strip()
 
-    # Remove ```json ... ```
-    text = re.sub(
-        r"^```json\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    # Remove ``` ... ```
-    text = re.sub(
-        r"^```\s*",
-        "",
-        text,
-    )
-
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text,
-    )
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
 
     return text.strip()
 
@@ -250,23 +165,83 @@ def clean_json_response(text):
 def parse_ai_json(text):
     """
     Parse and validate the AI's JSON response.
+
+    With Structured Outputs this should already be pure JSON. This
+    function is a defensive fallback for providers/models that don't
+    honor response_format and wrap the JSON in prose or code fences:
+
+    - Pure JSON
+    - JSON wrapped in Markdown fences
+    - Explanatory text before/after the JSON object
     """
+
+    if not isinstance(text, str):
+        raise RuntimeError("AI response is not text")
+
+    text = text.strip()
+
+    if not text:
+        raise RuntimeError(
+            "AI provider returned an empty response body"
+        )
+
+    # ---------------------------------------------------------------
+    # 1. Try the response exactly as returned
+    # ---------------------------------------------------------------
+
+    try:
+        result = json.loads(text)
+
+        if isinstance(result, dict):
+            return result
+
+    except json.JSONDecodeError:
+        pass
+
+    # ---------------------------------------------------------------
+    # 2. Remove Markdown code fences
+    # ---------------------------------------------------------------
 
     cleaned = clean_json_response(text)
 
     try:
         result = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"AI returned invalid JSON: {exc}"
-        ) from exc
 
-    if not isinstance(result, dict):
-        raise RuntimeError(
-            "AI response must be a JSON object"
-        )
+        if isinstance(result, dict):
+            return result
 
-    return result
+    except json.JSONDecodeError:
+        pass
+
+    # ---------------------------------------------------------------
+    # 3. Find a JSON object inside surrounding text
+    # ---------------------------------------------------------------
+
+    decoder = json.JSONDecoder()
+
+    for index, character in enumerate(cleaned):
+        if character != "{":
+            continue
+
+        try:
+            result, _ = decoder.raw_decode(cleaned[index:])
+
+            if isinstance(result, dict):
+                return result
+
+        except json.JSONDecodeError:
+            continue
+
+    # ---------------------------------------------------------------
+    # 4. Nothing valid was found
+    # ---------------------------------------------------------------
+
+    preview = cleaned[:500].replace("\n", "\\n")
+
+    raise RuntimeError(
+        "AI returned invalid JSON. "
+        f"Response preview: {preview}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -275,11 +250,8 @@ def parse_ai_json(text):
 
 def call_provider(url, key, model, prompt):
     """
-    Call an OpenAI-compatible Responses API provider.
-
-    The explicit User-Agent is important for Groq because some network
-    filtering can reject Python urllib's default client signature with
-    HTTP 403 / error code 1010.
+    Call an OpenAI-compatible Chat Completions provider with Structured
+    Outputs enabled, so the reply is constrained to our JSON schema.
     """
 
     if not key:
@@ -289,8 +261,19 @@ def call_provider(url, key, model, prompt):
 
     body = {
         "model": model,
-        "input": prompt,
-        "store": False,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "security_remediation",
+                "strict": True,
+                "schema": RESPONSE_SCHEMA,
+            },
+        },
+        "max_completion_tokens": MAX_OUTPUT_TOKENS,
     }
 
     request_data = json.dumps(body).encode("utf-8")
@@ -301,21 +284,13 @@ def call_provider(url, key, model, prompt):
         method="POST",
     )
 
-    request.add_header(
-        "Content-Type",
-        "application/json",
-    )
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Authorization", f"Bearer {key}")
 
-    request.add_header(
-        "Authorization",
-        f"Bearer {key}",
-    )
-
-    # Explicit client identity.
-    request.add_header(
-        "User-Agent",
-        USER_AGENT,
-    )
+    # Explicit client identity. Important for Groq: some network
+    # filtering can reject Python urllib's default client signature
+    # with HTTP 403 / error code 1010.
+    request.add_header("User-Agent", USER_AGENT)
 
     try:
         with urllib.request.urlopen(
@@ -331,34 +306,136 @@ def call_provider(url, key, model, prompt):
             data = json.loads(raw_response)
 
     except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode(
-            "utf-8",
-            errors="replace",
-        )
+        error_body = exc.read().decode("utf-8", errors="replace")
+
+        # A 400 on a strict json_schema request usually means the model
+        # doesn't support Structured Outputs. Retry once without it so
+        # we still get a usable (unstructured) answer instead of failing
+        # outright.
+        if exc.code == 400 and "response_format" not in error_body:
+            return _call_provider_unstructured(
+                url, key, model, prompt
+            )
+
+        if exc.code == 400 and (
+            "json_schema" in error_body or "response_format" in error_body
+        ):
+            return _call_provider_unstructured(
+                url, key, model, prompt
+            )
 
         # Do not expose API keys.
-        raise RuntimeError(
-            f"HTTP {exc.code}: {error_body}"
-        ) from exc
+        raise RuntimeError(f"HTTP {exc.code}: {error_body}") from exc
 
     except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Network error: {exc.reason}"
-        ) from exc
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
 
     except TimeoutError as exc:
-        raise RuntimeError(
-            "AI provider request timed out"
-        ) from exc
+        raise RuntimeError("AI provider request timed out") from exc
 
     except json.JSONDecodeError as exc:
+        raise RuntimeError("AI provider returned invalid JSON") from exc
+
+    return _parse_chat_completion(data)
+
+
+def _call_provider_unstructured(url, key, model, prompt):
+    """
+    Fallback for providers/models that reject the strict json_schema
+    response_format outright (HTTP 400). Falls back to best-effort
+    json_object mode, which is far more broadly supported, and relies
+    on parse_ai_json()'s defensive parsing.
+    """
+
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "max_completion_tokens": MAX_OUTPUT_TOKENS,
+    }
+
+    request_data = json.dumps(body).encode("utf-8")
+
+    request = urllib.request.Request(url, data=request_data, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Authorization", f"Bearer {key}")
+    request.add_header("User-Agent", USER_AGENT)
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=REQUEST_TIMEOUT,
+        ) as response:
+
+            raw_response = response.read().decode("utf-8", errors="replace")
+            data = json.loads(raw_response)
+
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {error_body}") from exc
+
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
+
+    except TimeoutError as exc:
+        raise RuntimeError("AI provider request timed out") from exc
+
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("AI provider returned invalid JSON") from exc
+
+    return _parse_chat_completion(data)
+
+
+def _parse_chat_completion(data):
+    """
+    Extract and parse the JSON answer out of a Chat Completions response.
+
+    Chat Completions always puts the answer in exactly one place:
+        data["choices"][0]["message"]["content"]
+    so there is no nested-structure guessing here, unlike the Responses
+    API's "output" array.
+    """
+
+    if not isinstance(data, dict):
+        raise RuntimeError("AI provider returned an invalid response object")
+
+    choices = data.get("choices")
+
+    if not isinstance(choices, list) or not choices:
+        error = data.get("error")
+
+        if isinstance(error, dict) and error.get("message"):
+            raise RuntimeError(f"AI provider error: {error['message']}")
+
         raise RuntimeError(
-            "AI provider returned invalid JSON"
-        ) from exc
+            "AI provider returned no choices in the response"
+        )
 
-    text = extract_output(data)
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
 
-    return parse_ai_json(text)
+    if not isinstance(message, dict):
+        raise RuntimeError("AI provider response is missing a message")
+
+    # A structured-output refusal surfaces here instead of content.
+    refusal = message.get("refusal")
+
+    if isinstance(refusal, str) and refusal.strip():
+        raise RuntimeError(f"AI provider refused the request: {refusal}")
+
+    content = message.get("content")
+
+    if not isinstance(content, str) or not content.strip():
+        finish_reason = choices[0].get("finish_reason", "unknown")
+
+        raise RuntimeError(
+            "AI provider returned no usable text output "
+            f"(finish_reason={finish_reason})"
+        )
+
+    return parse_ai_json(content)
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +477,16 @@ def call_ai(prompt):
             return result, "OpenAI"
 
         except Exception as exc:
-            errors.append(
-                f"OpenAI: {exc}"
-            )
+            error_text = str(exc)
+
+            if "credit_balance_exhausted" in error_text or (
+                "HTTP 429" in error_text and "quota" in error_text.lower()
+            ):
+                errors.append(
+                    "OpenAI: quota exhausted; using Groq fallback"
+                )
+            else:
+                errors.append(f"OpenAI: {error_text}")
 
     # ---------------------------------------------------------------
     # Groq fallback
@@ -420,22 +504,16 @@ def call_ai(prompt):
             return result, "Groq"
 
         except Exception as exc:
-            errors.append(
-                f"Groq: {exc}"
-            )
+            errors.append(f"Groq: {exc}")
 
     # ---------------------------------------------------------------
     # No provider succeeded
     # ---------------------------------------------------------------
 
     if errors:
-        raise RuntimeError(
-            " | ".join(errors)
-        )
+        raise RuntimeError(" | ".join(errors))
 
-    raise RuntimeError(
-        "No AI provider credential configured"
-    )
+    raise RuntimeError("No AI provider credential configured")
 
 
 # ---------------------------------------------------------------------------
@@ -493,27 +571,18 @@ def fix_one(file_path, rule, message):
     # ---------------------------------------------------------------
 
     if not os.path.isfile(file_path):
-        raise RuntimeError(
-            f"File not found: {file_path}"
-        )
+        raise RuntimeError(f"File not found: {file_path}")
 
     # ---------------------------------------------------------------
     # Read source file
     # ---------------------------------------------------------------
 
     try:
-        with open(
-            file_path,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
+        with open(file_path, "r", encoding="utf-8") as file:
             original = file.read()
 
     except OSError as exc:
-        raise RuntimeError(
-            f"Unable to read file {file_path}: {exc}"
-        ) from exc
+        raise RuntimeError(f"Unable to read file {file_path}: {exc}") from exc
 
     # ---------------------------------------------------------------
     # AI prompt
@@ -537,16 +606,8 @@ Security requirements:
    for the security fix.
 10. Preserve the existing application's intended behavior.
 11. Make the smallest reasonable security-focused change.
-12. Return the COMPLETE corrected file content.
-13. Do not return Markdown.
-14. Return valid JSON only.
-
-Required JSON structure:
-
-{{
-    "explanation": "2-3 concise sentences explaining the security fix",
-    "fixed_file_content": "FULL corrected file content"
-}}
+12. Return the COMPLETE corrected file content in "fixed_file_content".
+13. Put a 2-3 sentence explanation of the fix in "explanation".
 
 Finding:
 file={file_path}
@@ -573,14 +634,10 @@ Current file:
     explanation = result.get("explanation", "")
 
     if not isinstance(fixed, str):
-        raise RuntimeError(
-            "AI returned an invalid fixed_file_content value"
-        )
+        raise RuntimeError("AI returned an invalid fixed_file_content value")
 
     if not fixed.strip():
-        raise RuntimeError(
-            "AI returned an empty fixed_file_content"
-        )
+        raise RuntimeError("AI returned an empty fixed_file_content")
 
     if not isinstance(explanation, str):
         explanation = str(explanation)
@@ -605,29 +662,10 @@ def main():
         description="Generate a single AI-assisted security remediation."
     )
 
-    parser.add_argument(
-        "--file",
-        required=True,
-        help="Finding file path",
-    )
-
-    parser.add_argument(
-        "--rule",
-        required=True,
-        help="Scanner rule or finding ID",
-    )
-
-    parser.add_argument(
-        "--message",
-        required=True,
-        help="Finding message",
-    )
-
-    parser.add_argument(
-        "--ticket-id",
-        required=True,
-        help="Dashboard ticket ID",
-    )
+    parser.add_argument("--file", required=True, help="Finding file path")
+    parser.add_argument("--rule", required=True, help="Scanner rule or finding ID")
+    parser.add_argument("--message", required=True, help="Finding message")
+    parser.add_argument("--ticket-id", required=True, help="Dashboard ticket ID")
 
     args = parser.parse_args()
 
@@ -649,13 +687,7 @@ def main():
     # ---------------------------------------------------------------
 
     try:
-        with open(
-            file_path,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as file:
-
+        with open(file_path, "w", encoding="utf-8", newline="") as file:
             file.write(fixed)
 
     except OSError as exc:
@@ -670,12 +702,7 @@ def main():
     result_file = ".ai-fix-result.json"
 
     try:
-        with open(
-            result_file,
-            "w",
-            encoding="utf-8",
-        ) as file:
-
+        with open(result_file, "w", encoding="utf-8") as file:
             json.dump(
                 {
                     "provider": provider,
@@ -688,25 +715,15 @@ def main():
             )
 
     except OSError as exc:
-        raise RuntimeError(
-            f"Unable to write {result_file}: {exc}"
-        ) from exc
+        raise RuntimeError(f"Unable to write {result_file}: {exc}") from exc
 
     # ---------------------------------------------------------------
     # Console output
     # ---------------------------------------------------------------
 
-    print(
-        f"[ai-fix] Provider used: {provider}"
-    )
-
-    print(
-        f"[ai-fix] Applied proposed change to workspace: {file_path}"
-    )
-
-    print(
-        f"[ai-fix] Explanation: {explanation}"
-    )
+    print(f"[ai-fix] Provider used: {provider}")
+    print(f"[ai-fix] Applied proposed change to workspace: {file_path}")
+    print(f"[ai-fix] Explanation: {explanation}")
 
     return 0
 
