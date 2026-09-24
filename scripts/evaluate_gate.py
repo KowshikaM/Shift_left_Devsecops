@@ -2,6 +2,11 @@
 """Centralized Security Gate. Missing/malformed scanner output or non-zero scanner execution blocks the build."""
 import json, os, sys
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 FAIL_SEVERITIES = {"CRITICAL", "HIGH"}
 REQUIRED_RESULTS = [
     ("semgrep-results.json", "semgrep"),
