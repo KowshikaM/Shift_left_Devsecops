@@ -96,22 +96,31 @@ def safe_path(path):
 
 def extract_output(data):
     """
-    Extract text from an OpenAI-compatible Responses API response.
+    Extract generated text from an OpenAI-compatible Responses API response.
 
     Supports:
     - output_text
     - output[].content[].text
     - output[].content[].output_text
+    - output[].content[].text.value
+    - nested dictionaries/lists containing text
     """
 
     if not isinstance(data, dict):
         raise RuntimeError("AI provider returned an invalid response object")
 
-    # Standard Responses API convenience field.
+    # ---------------------------------------------------------------
+    # 1. Standard Responses API convenience field
+    # ---------------------------------------------------------------
+
     output_text = data.get("output_text")
 
     if isinstance(output_text, str) and output_text.strip():
         return output_text.strip()
+
+    # ---------------------------------------------------------------
+    # 2. Standard Responses API output array
+    # ---------------------------------------------------------------
 
     parts = []
 
@@ -119,26 +128,89 @@ def extract_output(data):
         if not isinstance(item, dict):
             continue
 
+        # Some providers expose text directly on the output item.
+        direct_text = item.get("text")
+
+        if isinstance(direct_text, str) and direct_text.strip():
+            parts.append(direct_text)
+
+        # Normal Responses API structure:
+        # output -> content -> text
         for content in item.get("content", []) or []:
             if not isinstance(content, dict):
                 continue
 
-            content_type = content.get("type")
+            text = content.get("text")
 
-            if content_type in ("output_text", "text"):
-                text = content.get("text", "")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+                continue
 
-                if isinstance(text, str):
-                    parts.append(text)
+            output_text_value = content.get("output_text")
 
-    result = "".join(parts).strip()
+            if isinstance(output_text_value, str) and output_text_value.strip():
+                parts.append(output_text_value)
+                continue
 
-    if not result:
-        raise RuntimeError(
-            "AI provider returned no usable text output"
-        )
+            # Some OpenAI-compatible providers may return:
+            # {"text": {"value": "..."}}
+            if isinstance(text, dict):
+                value = text.get("value")
 
-    return result
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+
+    result = "\n".join(parts).strip()
+
+    if result:
+        return result
+
+    # ---------------------------------------------------------------
+    # 3. Recursive fallback for OpenAI-compatible response variants
+    # ---------------------------------------------------------------
+
+    def find_text(value):
+        if isinstance(value, dict):
+            # Prefer explicit text fields.
+            for key in ("output_text", "text"):
+                candidate = value.get(key)
+
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+
+                if isinstance(candidate, dict):
+                    nested = find_text(candidate)
+
+                    if nested:
+                        return nested
+
+            for child in value.values():
+                nested = find_text(child)
+
+                if nested:
+                    return nested
+
+        elif isinstance(value, list):
+            for child in value:
+                nested = find_text(child)
+
+                if nested:
+                    return nested
+
+        return None
+
+    fallback = find_text(data)
+
+    if fallback:
+        return fallback
+
+    # ---------------------------------------------------------------
+    # Nothing usable found
+    # ---------------------------------------------------------------
+
+    raise RuntimeError(
+        "AI provider returned no usable text output"
+    )
 
 
 def clean_json_response(text):
