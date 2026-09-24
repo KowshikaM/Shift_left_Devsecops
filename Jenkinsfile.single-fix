@@ -178,7 +178,11 @@ pipeline {
 
                     New-Item -ItemType Directory -Force -Path ".scan-status" | Out-Null
 
-                    docker build -t "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" .
+                    $imageTag = "ai-$($env:BUILD_NUMBER)"
+                    $imageRef = "{0}:{1}" -f $env:IMAGE_NAME, $imageTag
+                    Write-Host "Building patched image: $imageRef"
+
+                    docker build --tag $imageRef .
 
                     if ($LASTEXITCODE -ne 0) {
                         '2' | Set-Content ".scan-status/trivy.status"
@@ -186,7 +190,7 @@ pipeline {
                     }
 
                     docker save `
-                      "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" `
+                      $imageRef `
                       -o "${env:WORKSPACE}\trivy-image.tar"
 
                     if ($LASTEXITCODE -ne 0) {
