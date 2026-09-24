@@ -560,7 +560,7 @@ def main():
     args = parser.parse_args()
 
     # Some scanner outputs may append line/column information.
-    file_path = args.file.split(":")[0]
+    file_path = normalize_path(args.file.split(":")[0])
 
     # ---------------------------------------------------------------
     # Generate remediation
