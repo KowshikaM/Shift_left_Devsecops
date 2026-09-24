@@ -54,6 +54,18 @@ pipeline {
         stage('Validate AI Patch — Semgrep') {
             steps {
                 powershell '''
+                    $ErrorActionPreference = "Continue"
+
+                    # Only validate the single file the AI was allowed to
+                    # touch (see ai_fix_single.py's safe_path()). Scanning
+                    # the whole app/ tree here would re-flag pre-existing,
+                    # unrelated findings on every ticket and permanently
+                    # block Security Gate regardless of what this specific
+                    # patch changed.
+                    $aiResult = Get-Content .ai-fix-result.json | ConvertFrom-Json
+                    $targetFile = $aiResult.file
+                    Write-Host "Semgrep target (AI-modified file only): $targetFile"
+
                     docker run --rm `
                       -v "${env:WORKSPACE}:/src" `
                       returntocorp/semgrep `
@@ -62,17 +74,33 @@ pipeline {
                       --config p/javascript `
                       --json `
                       --output /src/semgrep-results.json `
-                      /src/app
+                      "/src/$targetFile" 2>&1 | Out-String | Write-Host
 
                     $code = $LASTEXITCODE
+                    Write-Host "Semgrep exit code: $code"
 
                     if (!(Test-Path "semgrep-results.json")) {
                         '{}' | Set-Content semgrep-results.json
                     }
 
+                    # Semgrep exit codes:
+                    #   0 = no findings
+                    #   1 = findings present (still valid JSON output)
+                    #   2+ = scanner/runtime error
+                    #
+                    # Exit code 1 is intentionally allowed through so that
+                    # the Security Gate evaluates the actual findings.
+                    # $LASTEXITCODE is NOT reset by the checks above, so we
+                    # must exit explicitly here -- otherwise Jenkins treats
+                    # the step itself as failed because it inherits whatever
+                    # $LASTEXITCODE the docker command last left behind.
                     if ($code -ge 2) {
+                        Write-Host "Semgrep execution failed."
                         exit $code
                     }
+
+                    Write-Host "Semgrep validation stage completed."
+                    exit 0
                 '''
             }
         }
@@ -80,13 +108,23 @@ pipeline {
         stage('Validate AI Patch — Gitleaks') {
             steps {
                 powershell '''
+                    $ErrorActionPreference = "Continue"
+
                     Write-Host "Running Gitleaks validation..."
+
+                    # Same reasoning as the Semgrep stage above: only scan
+                    # the single file the AI was allowed to touch, not the
+                    # whole repo, so pre-existing/unrelated findings don't
+                    # block every ticket forever.
+                    $aiResult = Get-Content .ai-fix-result.json | ConvertFrom-Json
+                    $targetFile = $aiResult.file
+                    Write-Host "Gitleaks target (AI-modified file only): $targetFile"
 
                     docker run --rm `
                         -v "${env:WORKSPACE}:/repo" `
                         zricethezav/gitleaks:latest `
                         detect `
-                        --source /repo `
+                        --source "/repo/$targetFile" `
                         --no-git `
                         --report-format json `
                         --report-path /repo/gitleaks-results.json `
@@ -107,6 +145,10 @@ pipeline {
                     #
                     # Exit code 1 is intentionally allowed so that the
                     # Security Gate can evaluate the actual findings.
+                    # $LASTEXITCODE is NOT reset by the checks above, so we
+                    # must exit explicitly here -- otherwise Jenkins treats
+                    # the step itself as failed because it inherits whatever
+                    # $LASTEXITCODE the docker command last left behind.
                     if ($code -ge 2) {
                         Write-Host "Gitleaks execution failed."
                         Get-Content gitleaks-console.log
@@ -121,6 +163,7 @@ pipeline {
                     }
 
                     Write-Host "Gitleaks validation stage completed."
+                    exit 0
                 '''
             }
         }
@@ -128,6 +171,8 @@ pipeline {
         stage('Validate AI Patch — Docker/Trivy/OPA') {
             steps {
                 powershell '''
+                    $ErrorActionPreference = "Continue"
+
                     docker build -t "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" .
 
                     if ($LASTEXITCODE -ne 0) {
@@ -192,11 +237,23 @@ pipeline {
                         '[]' | Set-Content k8s-policy-results.json
                     }
 
+                    # conftest exit codes:
+                    #   0 = no policy violations
+                    #   1 = policy violations found (still valid JSON output)
+                    #   2+ = scanner/runtime error
+                    #
+                    # Exit code 1 is intentionally allowed through so the
+                    # Security Gate evaluates the actual findings. As with
+                    # the Semgrep/Gitleaks stages, $LASTEXITCODE is not
+                    # reset by the checks above, so we exit explicitly.
                     if ($d -ge 2 -or $k -ge 2) {
                         exit 2
                     }
 
                     Remove-Item "trivy-image.tar" -Force -ErrorAction SilentlyContinue
+
+                    Write-Host "Docker/Trivy/OPA validation stage completed."
+                    exit 0
                 '''
             }
         }
