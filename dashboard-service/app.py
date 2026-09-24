@@ -69,6 +69,19 @@ def init_db():
         if column not in columns:
             conn.execute(statement)
 
+    finding_columns = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+    finding_migrations = {
+        "remediation_type": "ALTER TABLE findings ADD COLUMN remediation_type TEXT DEFAULT 'MANUAL'",
+        "remediation_reason": "ALTER TABLE findings ADD COLUMN remediation_reason TEXT",
+        "remediation_guide": "ALTER TABLE findings ADD COLUMN remediation_guide TEXT",
+        "before_status": "ALTER TABLE findings ADD COLUMN before_status TEXT DEFAULT 'BLOCKED'",
+        "after_status": "ALTER TABLE findings ADD COLUMN after_status TEXT DEFAULT 'PENDING'",
+        "validation_summary": "ALTER TABLE findings ADD COLUMN validation_summary TEXT",
+    }
+    for column, statement in finding_migrations.items():
+        if column not in finding_columns:
+            conn.execute(statement)
+
     if "updated_at" not in columns:
         conn.execute("UPDATE builds SET updated_at = COALESCE(created_at, datetime('now')) WHERE updated_at IS NULL")
 
@@ -148,11 +161,19 @@ def create_build():
         for finding in findings:
             db.execute(
                 """INSERT INTO findings
-                   (build_id, source, severity, file_path, rule_id, message, fixed_version, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open')""",
+                   (build_id, source, severity, file_path, rule_id, message, fixed_version, status,
+                    remediation_type, remediation_reason, remediation_guide, before_status, after_status,
+                    validation_summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)""",
                 (build_id, finding.get("source", ""), finding.get("severity", "LOW"),
                  finding.get("file_path", ""), finding.get("rule_id", ""),
-                 finding.get("message", ""), finding.get("fixed_version", "-")),
+                 finding.get("message", ""), finding.get("fixed_version", "-"),
+                 finding.get("remediation_type", "MANUAL"),
+                 finding.get("remediation_reason", "Follow the remediation guide for a manual fix."),
+                 finding.get("remediation_guide", "Review the issue details and fix it in the affected file."),
+                 finding.get("before_status", "BLOCKED"),
+                 finding.get("after_status", "PENDING"),
+                 finding.get("validation_summary", "Before: blocked. After: validation pending.")),
             )
 
     db.commit()
@@ -270,6 +291,17 @@ def apply_ai_fix(finding_id):
     if not finding:
         return jsonify({"error": "not found"}), 404
 
+    remediation_type = str(finding["remediation_type"] or "MANUAL").upper()
+    if remediation_type not in {"AI_ELIGIBLE", "AI_ASSISTED"}:
+        log_event(finding["build_id"], finding_id, "ai_fix_blocked_manual",
+                  "AI is blocked because the finding requires manual remediation.")
+        return jsonify({
+            "status": "blocked",
+            "detail": "This finding requires manual remediation. Review the remediation guide before changing the code.",
+            "remediation_type": remediation_type,
+            "remediation_reason": finding["remediation_reason"] or "Manual review required.",
+        }), 400
+
     ok, error = trigger_jenkins_fix_job(finding)
 
     if ok:
@@ -297,6 +329,40 @@ def mark_pr_opened(finding_id):
     finding = db.execute("SELECT build_id FROM findings WHERE id = ?", (finding_id,)).fetchone()
     log_event(finding["build_id"], finding_id, "ai_fix_pr_opened", payload.get("pr_url", ""))
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/tickets/<int:finding_id>/validation-result", methods=["POST"])
+def update_validation_result(finding_id):
+    """Update the existing ticket with the real post-remediation validation outcome."""
+    payload = request.get_json(force=True) if request.data else {}
+    db = get_db()
+    finding = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
+    if not finding:
+        return jsonify({"error": "not found"}), 404
+
+    status = str(payload.get("status", "PENDING")).upper()
+    if status not in {"PASS", "FAIL", "PENDING"}:
+        status = "PENDING"
+
+    validation_summary = payload.get("validation_summary") or (
+        f"Before: {finding['before_status'] or 'BLOCKED'}. After: {status}."
+    )
+    ttl = payload.get("explanation") or validation_summary
+
+    db.execute(
+        "UPDATE findings SET status = ?, after_status = ?, validation_summary = ?, ai_explanation = ?, updated_at = ? WHERE id = ?",
+        ("ai_fix_validated" if status in {"PASS", "FAIL"} else "ai_fix_pending",
+         status,
+         validation_summary,
+         ttl,
+         datetime.utcnow().isoformat(),
+         finding_id),
+    )
+    db.commit()
+
+    finding = db.execute("SELECT build_id FROM findings WHERE id = ?", (finding_id,)).fetchone()
+    log_event(finding["build_id"], finding_id, "validation_result", f"after_status={status}; {validation_summary}")
+    return jsonify({"status": "ok", "after_status": status})
 
 
 @app.route("/api/tickets/<int:finding_id>/resolve", methods=["POST"])

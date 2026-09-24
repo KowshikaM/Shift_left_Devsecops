@@ -103,6 +103,10 @@ async function applyAiFix(ticketId, btn) {
   renderTickets();
 }
 
+function showRemediationGuide(ticketId, guideText) {
+  alert(guideText || "No remediation guide available for this issue.");
+}
+
 async function resolveManually(ticketId, btn) {
   btn.disabled = true;
   await fetchJSON(`/api/tickets/${ticketId}/resolve`, {
@@ -126,8 +130,17 @@ async function renderTickets() {
   list.innerHTML = open.map(t => {
     const color = SEVERITY_COLOR[t.severity] || "var(--text-muted)";
     const bg = SEVERITY_BG[t.severity] || "var(--border)";
-    const canApplyAi = t.status === "open";
+    const remediationType = (t.remediation_type || "MANUAL").toUpperCase();
+    const canApplyAi = t.status === "open" && ["AI_ELIGIBLE", "AI_ASSISTED"].includes(remediationType);
     const prLink = t.pr_url ? `<a href="${t.pr_url}" target="_blank" rel="noopener">View PR</a>` : "";
+    const remediationReason = t.remediation_reason ? `<div class="ticket-meta" style="margin-top: 0.5rem; color: var(--text-muted);">${t.remediation_reason}</div>` : "";
+    const beforeStatus = t.before_status || "BLOCKED";
+    const afterStatus = t.after_status || "PENDING";
+    const validationSummary = t.validation_summary || "Before: blocked. After: validation pending.";
+    const guideButton = remediationType === "MANUAL"
+      ? `<button class="btn" onclick="showRemediationGuide(${t.id}, ${JSON.stringify(t.remediation_guide || "No remediation guide available.")})">View remediation guide</button>`
+      : `<button class="btn btn-primary" ${canApplyAi ? "" : "disabled"} onclick="applyAiFix(${t.id}, this)">${remediationType === "AI_ASSISTED" ? "Generate proposal" : "Apply AI fix"}</button>`;
+
     return `
     <div class="ticket-card">
       <div class="ticket-head">
@@ -135,14 +148,18 @@ async function renderTickets() {
           <div class="ticket-title">${t.message || t.rule_id}</div>
           <div class="ticket-meta mono">${t.file_path || ""} &middot; ${t.rule_id || ""} &middot; build #${t.build_number}</div>
         </div>
-        <div style="display:flex; gap:0.4rem; align-items:center;">
+        <div style="display:flex; gap:0.4rem; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
           <span class="sev-pill" style="color:${color};background:${bg};border-color:${color}33">${t.severity}</span>
           <span class="status-pill status-${t.status}">${t.status.replace(/_/g, " ")}</span>
+          <span class="status-pill" style="background: rgba(14,116,144,0.1); color: #0E7490; border-color: rgba(14,116,144,0.2);">${remediationType.replace(/_/g, " ")}</span>
         </div>
       </div>
+      ${remediationReason}
+      <div class="ticket-meta" style="margin-top: 0.5rem; color: var(--text-muted);">Before: <strong>${beforeStatus}</strong> &nbsp;|&nbsp; After: <strong>${afterStatus}</strong></div>
+      <div class="ticket-meta" style="margin-top: 0.3rem; color: var(--text-muted);">${validationSummary}</div>
       ${t.ai_explanation ? `<p style="font-size:0.85rem;color:var(--text-muted);margin:0.6rem 0 0;">${t.ai_explanation} ${prLink}</p>` : ""}
       <div class="ticket-actions">
-        <button class="btn btn-primary" ${canApplyAi ? "" : "disabled"} onclick="applyAiFix(${t.id}, this)">Apply AI fix</button>
+        ${guideButton}
         <button class="btn" onclick="resolveManually(${t.id}, this)">Mark resolved manually</button>
       </div>
     </div>`;

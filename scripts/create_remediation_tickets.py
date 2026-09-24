@@ -22,6 +22,69 @@ GENERIC_HINTS = {
 }
 
 
+def classify_finding(source, rule_id, file_name, message):
+    text = " ".join([str(source or ""), str(rule_id or ""), str(file_name or ""), str(message or "")]).lower()
+
+    if "gitleaks" in text or "secret" in text or "credential" in text or "password" in text or "token" in text or "api key" in text:
+        return {
+            "classification": "MANUAL",
+            "why": "The issue exposes credential material or secret data, which must never be sent to an AI provider.",
+            "plan": [
+                "Revoke or rotate the exposed secret immediately.",
+                "Remove the secret from source control and configuration files.",
+                "Load the value from a secrets manager or environment variable.",
+                "Re-run the scanner and confirm the secret is gone before merge."
+            ],
+        }
+
+    if "kubernetes" in text or "dockerfile" in text or "resource limit" in text or "run as non root" in text or "allow privilege escalation" in text:
+        return {
+            "classification": "AI_ELIGIBLE",
+            "why": "This is a deterministic hardening requirement with a clear, policy-based remediation path.",
+            "plan": [
+                "Update the manifest or Dockerfile to satisfy the policy.",
+                "Add the required security settings such as resource limits or non-root execution.",
+                "Validate the modified file with the security gate and re-run the pipeline.",
+                "Open a human-reviewed PR if the fix passes the checks."
+            ],
+        }
+
+    if "sql injection" in text or "command injection" in text or "xss" in text or "path traversal" in text or "unsafe deserialization" in text:
+        return {
+            "classification": "MANUAL",
+            "why": "This is an application logic issue that affects business behavior and requires developer review, not blind automation.",
+            "plan": [
+                "Identify the unsafe input sink and the user-controlled data flow.",
+                "Replace unsafe concatenation or string-building with parameterized or validated input handling.",
+                "Add or update a regression test covering the vulnerable path.",
+                "Re-run Semgrep and the relevant tests, then submit a human-reviewed fix."
+            ],
+        }
+
+    if source in ("trivy", "semgrep"):
+        return {
+            "classification": "AI_ASSISTED",
+            "why": "This issue may be fixable with a recommended patch, but it still needs human review to confirm behavior and safety.",
+            "plan": [
+                "Review the exact vulnerability and affected file.",
+                "Use the AI suggestion only as a starting point, not as an automatic merge.",
+                "Verify the change with the relevant scanner and tests.",
+                "Approve the PR only after the remediation is validated."
+            ],
+        }
+
+    return {
+        "classification": "MANUAL",
+        "why": "This issue requires human investigation because it is neither a simple policy fix nor a safe automated patch target.",
+        "plan": [
+            "Inspect the root cause in the relevant file.",
+            "Apply the minimal secure change that addresses the actual issue.",
+            "Validate the fix using the security gate and unit checks.",
+            "Submit the change for human review before merge."
+        ],
+    }
+
+
 def load_json(path, default=None):
     if not os.path.exists(path):
         return default if default is not None else {}
@@ -40,6 +103,7 @@ def gather_findings():
         for vuln in result.get("Vulnerabilities", []) or []:
             if vuln.get("Severity") in ("CRITICAL", "HIGH"):
                 pkg = vuln.get("PkgName", "")
+                classification = classify_finding("trivy", vuln.get("VulnerabilityID", ""), pkg, vuln.get("Title", ""))
                 findings.append({
                     "marker": f"trivy:{vuln.get('VulnerabilityID')}:{pkg}",
                     "title": f"[Security] {vuln.get('VulnerabilityID')} in {pkg} ({vuln.get('Severity')})",
@@ -47,7 +111,11 @@ def gather_findings():
                         f"**Source:** Trivy container scan\n"
                         f"**Package:** {pkg} {vuln.get('InstalledVersion','')}\n"
                         f"**Fixed in:** {vuln.get('FixedVersion','N/A')}\n"
-                        f"**Severity:** {vuln.get('Severity')}\n\n"
+                        f"**Severity:** {vuln.get('Severity')}\n"
+                        f"**Classification:** {classification['classification']}\n"
+                        f"**Why this happened:** {classification['why']}\n\n"
+                        f"**Remediation steps:**\n"
+                        + "\n".join(f"{i+1}. {step}" for i, step in enumerate(classification['plan'])) + "\n\n"
                         f"**Suggested remediation:** {GENERIC_HINTS['trivy']}\n"
                     ),
                 })
@@ -55,26 +123,36 @@ def gather_findings():
     semgrep = load_json("semgrep-results.json", default={})
     for res in semgrep.get("results", []):
         if res.get("extra", {}).get("severity", "").upper() == "ERROR":
+            classification = classify_finding("semgrep", res.get("check_id", ""), res.get("path", ""), res.get("extra", {}).get("message", ""))
             findings.append({
                 "marker": f"semgrep:{res.get('check_id')}:{res.get('path')}:{res.get('start',{}).get('line')}",
                 "title": f"[Security] SAST finding: {res.get('check_id')}",
                 "body": (
                     f"**Source:** Semgrep SAST\n"
                     f"**File:** {res.get('path')}:{res.get('start', {}).get('line')}\n\n"
-                    f"{res.get('extra', {}).get('message', '')}\n\n"
+                    f"{res.get('extra', {}).get('message', '')}\n"
+                    f"**Classification:** {classification['classification']}\n"
+                    f"**Why this happened:** {classification['why']}\n\n"
+                    f"**Remediation steps:**\n"
+                    + "\n".join(f"{i+1}. {step}" for i, step in enumerate(classification['plan'])) + "\n\n"
                     f"**Suggested remediation:** {GENERIC_HINTS['semgrep']}\n"
                 ),
             })
 
     gitleaks = load_json("gitleaks-results.json", default=[])
     for leak in (gitleaks if isinstance(gitleaks, list) else []):
+        classification = classify_finding("gitleaks", leak.get("RuleID", ""), leak.get("File", ""), leak.get("Description", ""))
         findings.append({
             "marker": f"gitleaks:{leak.get('File')}:{leak.get('RuleID')}",
             "title": f"[Security] Hardcoded secret detected in {leak.get('File')}",
             "body": (
                 f"**Source:** Gitleaks secret scan\n"
                 f"**File:** {leak.get('File')}\n"
-                f"**Rule:** {leak.get('RuleID')}\n\n"
+                f"**Rule:** {leak.get('RuleID')}\n"
+                f"**Classification:** {classification['classification']}\n"
+                f"**Why this happened:** {classification['why']}\n\n"
+                f"**Remediation steps:**\n"
+                + "\n".join(f"{i+1}. {step}" for i, step in enumerate(classification['plan'])) + "\n\n"
                 f"**Suggested remediation:** {GENERIC_HINTS['gitleaks']}\n"
             ),
         })
@@ -86,13 +164,18 @@ def gather_findings():
         for entry in entries:
             for failure in entry.get("failures", []) or []:
                 msg = str(failure.get("msg", failure))
+                classification = classify_finding(label, msg, entry.get("filename", label), msg)
                 findings.append({
                     "marker": f"policy:{label}:{msg[:60]}",
                     "title": f"[Security] {label} policy violation",
                     "body": (
                         f"**Source:** OPA/Conftest ({label})\n"
                         f"**File:** {entry.get('filename', label)}\n\n"
-                        f"{msg}\n\n"
+                        f"{msg}\n"
+                        f"**Classification:** {classification['classification']}\n"
+                        f"**Why this happened:** {classification['why']}\n\n"
+                        f"**Remediation steps:**\n"
+                        + "\n".join(f"{i+1}. {step}" for i, step in enumerate(classification['plan'])) + "\n\n"
                         f"**Suggested remediation:** {GENERIC_HINTS['opa-policy']}\n"
                     ),
                 })

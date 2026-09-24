@@ -189,9 +189,12 @@ pipeline {
                         exit 1
                     }
 
+                    $trivyTar = Join-Path $env:WORKSPACE "trivy-image.tar"
+                    Write-Host "Trivy image tar path: $trivyTar"
+
                     docker save `
                       $imageRef `
-                      -o "${env:WORKSPACE}\trivy-image.tar"
+                      -o $trivyTar
 
                     if ($LASTEXITCODE -ne 0) {
                         '2' | Set-Content ".scan-status/trivy.status"
@@ -306,6 +309,19 @@ pipeline {
                     python scripts/evaluate_gate.py
                     $gateCode = $LASTEXITCODE
 
+                    $gateStatus = if ($gateCode -eq 0) { "PASS" } else { "FAIL" }
+                    $summaryParts = @()
+                    Get-ChildItem ".scan-status" | ForEach-Object {
+                        $summaryParts += "$($_.Name)=$((Get-Content $_.FullName -Raw).Trim())"
+                    }
+                    $summary = ($summaryParts -join "; ") + "; gate=$gateStatus"
+
+                    @{
+                        status = $gateStatus
+                        validation_summary = $summary
+                        explanation = "AI patch validated by Jenkins: $gateStatus; scanner statuses: $summary"
+                    } | ConvertTo-Json -Depth 5 | Set-Content "ai-validation-result.json"
+
                     if ($gateCode -ne 0) {
                         Write-Host "Security Gate: FAIL"
                         exit $gateCode
@@ -313,6 +329,25 @@ pipeline {
 
                     Write-Host "Security Gate: PASS"
                     exit 0
+                '''
+            }
+        }
+
+        stage('Update Ticket Validation Status') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Continue"
+
+                    if (Test-Path "ai-validation-result.json") {
+                        $payload = Get-Content "ai-validation-result.json" -Raw
+                        if (-not [string]::IsNullOrWhiteSpace($payload)) {
+                            $callback = "$env:DASHBOARD_CALLBACK_URL"
+                            if (-not [string]::IsNullOrWhiteSpace($callback)) {
+                                Write-Host "Updating dashboard ticket validation for ticket #$env:TICKET_ID"
+                                python -c "import json, os, urllib.request; payload = json.load(open('ai-validation-result.json', encoding='utf-8')); url = os.environ['DASHBOARD_CALLBACK_URL'].rstrip('/') + '/api/tickets/' + os.environ['TICKET_ID'] + '/validation-result'; req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), method='POST'); req.add_header('Content-Type', 'application/json'); urllib.request.urlopen(req, timeout=10); print('[validation] ticket updated')"
+                            }
+                        }
+                    }
                 '''
             }
         }
