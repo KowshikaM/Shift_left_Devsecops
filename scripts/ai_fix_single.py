@@ -40,9 +40,14 @@ import argparse
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # API configuration
