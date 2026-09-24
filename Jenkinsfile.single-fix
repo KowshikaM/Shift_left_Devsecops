@@ -56,15 +56,18 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Continue"
 
-                    # Only validate the single file the AI was allowed to
-                    # touch (see ai_fix_single.py's safe_path()). Scanning
-                    # the whole app/ tree here would re-flag pre-existing,
-                    # unrelated findings on every ticket and permanently
-                    # block Security Gate regardless of what this specific
-                    # patch changed.
-                    $aiResult = Get-Content .ai-fix-result.json | ConvertFrom-Json
+                    $aiResult = Get-Content ".ai-fix-result.json" | ConvertFrom-Json
                     $targetFile = $aiResult.file
+
+                    if ([string]::IsNullOrWhiteSpace($targetFile)) {
+                        Write-Host "AI result does not contain a target file."
+                        exit 2
+                    }
+
+                    $targetFile = $targetFile.Replace("\\","/").TrimStart("./")
                     Write-Host "Semgrep target (AI-modified file only): $targetFile"
+
+                    New-Item -ItemType Directory -Force -Path ".scan-status" | Out-Null
 
                     docker run --rm `
                       -v "${env:WORKSPACE}:/src" `
@@ -73,33 +76,31 @@ pipeline {
                       --config p/owasp-top-ten `
                       --config p/javascript `
                       --json `
-                      --output /src/semgrep-results.json `
-                      "/src/$targetFile" 2>&1 | Out-String | Write-Host
+                      --output "/src/semgrep-results.json" `
+                      "/src/$targetFile" `
+                      *> semgrep-console.log
 
                     $code = $LASTEXITCODE
                     Write-Host "Semgrep exit code: $code"
 
                     if (!(Test-Path "semgrep-results.json")) {
-                        '{}' | Set-Content semgrep-results.json
+                        '{}' | Set-Content "semgrep-results.json"
                     }
 
-                    # Semgrep exit codes:
-                    #   0 = no findings
-                    #   1 = findings present (still valid JSON output)
-                    #   2+ = scanner/runtime error
-                    #
-                    # Exit code 1 is intentionally allowed through so that
-                    # the Security Gate evaluates the actual findings.
-                    # $LASTEXITCODE is NOT reset by the checks above, so we
-                    # must exit explicitly here -- otherwise Jenkins treats
-                    # the step itself as failed because it inherits whatever
-                    # $LASTEXITCODE the docker command last left behind.
                     if ($code -ge 2) {
-                        Write-Host "Semgrep execution failed."
+                        '2' | Set-Content ".scan-status/semgrep.status"
+                        Get-Content semgrep-console.log
                         exit $code
                     }
 
-                    Write-Host "Semgrep validation stage completed."
+                    if ($code -eq 1) {
+                        '1' | Set-Content ".scan-status/semgrep.status"
+                        Write-Host "Semgrep found findings."
+                    } else {
+                        '0' | Set-Content ".scan-status/semgrep.status"
+                        Write-Host "Semgrep found no findings."
+                    }
+
                     exit 0
                 '''
             }
@@ -110,59 +111,50 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Continue"
 
-                    Write-Host "Running Gitleaks validation..."
-
-                    # Same reasoning as the Semgrep stage above: only scan
-                    # the single file the AI was allowed to touch, not the
-                    # whole repo, so pre-existing/unrelated findings don't
-                    # block every ticket forever.
-                    $aiResult = Get-Content .ai-fix-result.json | ConvertFrom-Json
+                    $aiResult = Get-Content ".ai-fix-result.json" | ConvertFrom-Json
                     $targetFile = $aiResult.file
+
+                    if ([string]::IsNullOrWhiteSpace($targetFile)) {
+                        Write-Host "AI result does not contain a target file."
+                        exit 2
+                    }
+
+                    $targetFile = $targetFile.Replace("\\","/").TrimStart("./")
                     Write-Host "Gitleaks target (AI-modified file only): $targetFile"
 
+                    New-Item -ItemType Directory -Force -Path ".scan-status" | Out-Null
+
                     docker run --rm `
-                        -v "${env:WORKSPACE}:/repo" `
-                        zricethezav/gitleaks:latest `
-                        detect `
-                        --source "/repo/$targetFile" `
-                        --no-git `
-                        --report-format json `
-                        --report-path /repo/gitleaks-results.json `
-                        *> gitleaks-console.log
+                      -v "${env:WORKSPACE}:/repo" `
+                      zricethezav/gitleaks:latest `
+                      detect `
+                      --source "/repo/$targetFile" `
+                      --no-git `
+                      --report-format json `
+                      --report-path "/repo/gitleaks-results.json" `
+                      *> gitleaks-console.log
 
                     $code = $LASTEXITCODE
-
                     Write-Host "Gitleaks exit code: $code"
 
                     if (!(Test-Path "gitleaks-results.json")) {
-                        '[]' | Set-Content gitleaks-results.json
+                        '[]' | Set-Content "gitleaks-results.json"
                     }
 
-                    # Gitleaks:
-                    #   0 = no leaks
-                    #   1 = leaks found
-                    #   2+ = scanner/runtime error
-                    #
-                    # Exit code 1 is intentionally allowed so that the
-                    # Security Gate can evaluate the actual findings.
-                    # $LASTEXITCODE is NOT reset by the checks above, so we
-                    # must exit explicitly here -- otherwise Jenkins treats
-                    # the step itself as failed because it inherits whatever
-                    # $LASTEXITCODE the docker command last left behind.
                     if ($code -ge 2) {
-                        Write-Host "Gitleaks execution failed."
+                        '2' | Set-Content ".scan-status/gitleaks.status"
                         Get-Content gitleaks-console.log
                         exit $code
-                    }   
+                    }
 
                     if ($code -eq 1) {
+                        '1' | Set-Content ".scan-status/gitleaks.status"
                         Write-Host "Gitleaks found potential secrets."
-                        Write-Host "Security Gate will evaluate the findings."
                     } else {
+                        '0' | Set-Content ".scan-status/gitleaks.status"
                         Write-Host "Gitleaks found no secrets."
                     }
 
-                    Write-Host "Gitleaks validation stage completed."
                     exit 0
                 '''
             }
@@ -173,10 +165,24 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Continue"
 
+                    $aiResult = Get-Content ".ai-fix-result.json" | ConvertFrom-Json
+                    $targetFile = $aiResult.file
+
+                    if ([string]::IsNullOrWhiteSpace($targetFile)) {
+                        Write-Host "AI result does not contain a target file."
+                        exit 2
+                    }
+
+                    $targetFile = $targetFile.Replace("\\","/").TrimStart("./")
+                    Write-Host "AI-modified file: $targetFile"
+
+                    New-Item -ItemType Directory -Force -Path ".scan-status" | Out-Null
+
                     docker build -t "$env:IMAGE_NAME:ai-$env:BUILD_NUMBER" .
 
                     if ($LASTEXITCODE -ne 0) {
-                        exit $LASTEXITCODE
+                        '2' | Set-Content ".scan-status/trivy.status"
+                        exit 1
                     }
 
                     docker save `
@@ -184,7 +190,8 @@ pipeline {
                       -o "${env:WORKSPACE}\trivy-image.tar"
 
                     if ($LASTEXITCODE -ne 0) {
-                        exit $LASTEXITCODE
+                        '2' | Set-Content ".scan-status/trivy.status"
+                        exit 1
                     }
 
                     docker run --rm `
@@ -195,64 +202,83 @@ pipeline {
                       --format json `
                       --output /out/trivy-results.json `
                       --severity CRITICAL,HIGH,MEDIUM `
-                      --timeout 10m
+                      --timeout 10m `
+                      *> trivy-console.log
 
                     $trivyCode = $LASTEXITCODE
+                    Write-Host "Trivy exit code: $trivyCode"
 
                     if (!(Test-Path "trivy-results.json")) {
-                        '{}' | Set-Content trivy-results.json
+                        '{}' | Set-Content "trivy-results.json"
                     }
 
                     if ($trivyCode -ge 2) {
+                        '2' | Set-Content ".scan-status/trivy.status"
+                        Get-Content trivy-console.log
                         exit $trivyCode
                     }
 
-                    docker run --rm `
-                      -v "${env:WORKSPACE}:/project" `
-                      openpolicyagent/conftest `
-                      test `
-                      /project/Dockerfile `
-                      --policy /project/policy `
-                      --output json |
-                      Set-Content dockerfile-policy-results.json
+                    # Trivy's JSON contains findings; evaluate_gate.py handles
+                    # the actual vulnerability result. Status 0 means execution
+                    # completed successfully.
+                    '0' | Set-Content ".scan-status/trivy.status"
 
-                    $d = $LASTEXITCODE
+                    # Dockerfile policy is relevant only when Dockerfile changed.
+                    if ($targetFile -eq "Dockerfile") {
+                        docker run --rm `
+                          -v "${env:WORKSPACE}:/project" `
+                          openpolicyagent/conftest `
+                          test /project/Dockerfile `
+                          --policy /project/policy `
+                          --output json `
+                          *> dockerfile-policy-console.log
 
-                    docker run --rm `
-                      -v "${env:WORKSPACE}:/project" `
-                      openpolicyagent/conftest `
-                      test `
-                      /project/k8s/deployment.yaml `
-                      --policy /project/policy `
-                      --output json |
-                      Set-Content k8s-policy-results.json
+                        $d = $LASTEXITCODE
 
-                    $k = $LASTEXITCODE
+                        if ($d -ge 2) {
+                            '2' | Set-Content ".scan-status/docker-policy.status"
+                            Get-Content dockerfile-policy-console.log
+                            exit $d
+                        }
 
-                    if (!(Test-Path "dockerfile-policy-results.json")) {
-                        '[]' | Set-Content dockerfile-policy-results.json
+                        if ($d -eq 1) {
+                            '1' | Set-Content ".scan-status/docker-policy.status"
+                        } else {
+                            '0' | Set-Content ".scan-status/docker-policy.status"
+                        }
+                    } else {
+                        '0' | Set-Content ".scan-status/docker-policy.status"
                     }
 
-                    if (!(Test-Path "k8s-policy-results.json")) {
-                        '[]' | Set-Content k8s-policy-results.json
-                    }
+                    # Kubernetes policy is relevant only when a k8s file changed.
+                    if ($targetFile -like "k8s/*") {
+                        docker run --rm `
+                          -v "${env:WORKSPACE}:/project" `
+                          openpolicyagent/conftest `
+                          test "/project/$targetFile" `
+                          --policy /project/policy `
+                          --output json `
+                          *> k8s-policy-console.log
 
-                    # conftest exit codes:
-                    #   0 = no policy violations
-                    #   1 = policy violations found (still valid JSON output)
-                    #   2+ = scanner/runtime error
-                    #
-                    # Exit code 1 is intentionally allowed through so the
-                    # Security Gate evaluates the actual findings. As with
-                    # the Semgrep/Gitleaks stages, $LASTEXITCODE is not
-                    # reset by the checks above, so we exit explicitly.
-                    if ($d -ge 2 -or $k -ge 2) {
-                        exit 2
+                        $k = $LASTEXITCODE
+
+                        if ($k -ge 2) {
+                            '2' | Set-Content ".scan-status/k8s-policy.status"
+                            Get-Content k8s-policy-console.log
+                            exit $k
+                        }
+
+                        if ($k -eq 1) {
+                            '1' | Set-Content ".scan-status/k8s-policy.status"
+                        } else {
+                            '0' | Set-Content ".scan-status/k8s-policy.status"
+                        }
+                    } else {
+                        '0' | Set-Content ".scan-status/k8s-policy.status"
                     }
 
                     Remove-Item "trivy-image.tar" -Force -ErrorAction SilentlyContinue
-
-                    Write-Host "Docker/Trivy/OPA validation stage completed."
+                    Write-Host "Docker/Trivy/OPA validation completed."
                     exit 0
                 '''
             }
@@ -261,19 +287,28 @@ pipeline {
         stage('Security Gate') {
             steps {
                 powershell '''
-                    New-Item -ItemType Directory -Force -Path .scan-status | Out-Null
+                    $ErrorActionPreference = "Stop"
 
-                    '0' | Set-Content .scan-status/semgrep.status
-                    '0' | Set-Content .scan-status/gitleaks.status
-                    '0' | Set-Content .scan-status/trivy.status
-                    '0' | Set-Content .scan-status/docker-policy.status
-                    '0' | Set-Content .scan-status/k8s-policy.status
+                    if (!(Test-Path ".scan-status")) {
+                        Write-Host "Scanner status directory is missing."
+                        exit 2
+                    }
+
+                    Write-Host "Actual scanner statuses:"
+                    Get-ChildItem ".scan-status" | ForEach-Object {
+                        Write-Host "$($_.Name): $((Get-Content $_.FullName -Raw).Trim())"
+                    }
 
                     python scripts/evaluate_gate.py
+                    $gateCode = $LASTEXITCODE
 
-                    if ($LASTEXITCODE -ne 0) {
-                        exit $LASTEXITCODE
+                    if ($gateCode -ne 0) {
+                        Write-Host "Security Gate: FAIL"
+                        exit $gateCode
                     }
+
+                    Write-Host "Security Gate: PASS"
+                    exit 0
                 '''
             }
         }
