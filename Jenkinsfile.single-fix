@@ -80,24 +80,47 @@ pipeline {
         stage('Validate AI Patch — Gitleaks') {
             steps {
                 powershell '''
+                    Write-Host "Running Gitleaks validation..."
+
                     docker run --rm `
-                      -v "${env:WORKSPACE}:/repo" `
-                      zricethezav/gitleaks:latest `
-                      detect `
-                      --source /repo `
-                      --no-git `
-                      --report-format json `
-                      --report-path /repo/gitleaks-results.json
+                        -v "${env:WORKSPACE}:/repo" `
+                        zricethezav/gitleaks:latest `
+                        detect `
+                        --source /repo `
+                        --no-git `
+                        --report-format json `
+                        --report-path /repo/gitleaks-results.json `
+                        *> gitleaks-console.log
 
                     $code = $LASTEXITCODE
+
+                    Write-Host "Gitleaks exit code: $code"
 
                     if (!(Test-Path "gitleaks-results.json")) {
                         '[]' | Set-Content gitleaks-results.json
                     }
 
+                    # Gitleaks:
+                    #   0 = no leaks
+                    #   1 = leaks found
+                    #   2+ = scanner/runtime error
+                    #
+                    # Exit code 1 is intentionally allowed so that the
+                    # Security Gate can evaluate the actual findings.
                     if ($code -ge 2) {
+                        Write-Host "Gitleaks execution failed."
+                        Get-Content gitleaks-console.log
                         exit $code
+                    }   
+
+                    if ($code -eq 1) {
+                        Write-Host "Gitleaks found potential secrets."
+                        Write-Host "Security Gate will evaluate the findings."
+                    } else {
+                        Write-Host "Gitleaks found no secrets."
                     }
+
+                    Write-Host "Gitleaks validation stage completed."
                 '''
             }
         }
