@@ -12,7 +12,7 @@ def load_json(path, default=None):
     if not os.path.exists(path):
         return default if default is not None else {}
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return default if default is not None else {}
