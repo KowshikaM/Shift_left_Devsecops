@@ -124,6 +124,9 @@ pipeline {
                         -Path ".scan-status" |
                         Out-Null
 
+                    '[]' | Set-Content "dockerfile-policy-results.json"
+                    '[]' | Set-Content "k8s-policy-results.json"
+
                     docker run --rm `
                       -v "${env:WORKSPACE}:/src" `
                       returntocorp/semgrep `
@@ -364,7 +367,8 @@ pipeline {
                           test /project/Dockerfile `
                           --policy /project/policy `
                           --output json `
-                          *> dockerfile-policy-console.log
+                          > dockerfile-policy-results.json `
+                          2> dockerfile-policy-console.log
 
                         $d = $LASTEXITCODE
 
@@ -404,7 +408,8 @@ pipeline {
                           test "/project/$targetFile" `
                           --policy /project/policy `
                           --output json `
-                          *> k8s-policy-console.log
+                          > k8s-policy-results.json `
+                          2> k8s-policy-console.log
 
                         $k = $LASTEXITCODE
 
