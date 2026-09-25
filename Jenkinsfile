@@ -145,9 +145,10 @@ pipeline {
                       image `
                       --input /out/trivy-image.tar `
                       --format json `
-                      --output /out/trivy-results.json `
                       --severity CRITICAL,HIGH,MEDIUM `
-                      --timeout 10m
+                      --timeout 10m `
+                      1> trivy-results.json `
+                      2> trivy-console.log
 
                     $code = $LASTEXITCODE
 
@@ -441,6 +442,7 @@ pipeline {
                     def finalGate = fileExists('gate-status.txt')
                         ? readFile('gate-status.txt').trim().toUpperCase()
                         : 'FAIL'
+                    env.GATE_STATUS = finalGate
                     if (finalGate == 'PASS') {
                         env.PIPELINE_STAGE = 'Pipeline Completed Successfully'
                         env.PIPELINE_STATUS = 'PASSED'
