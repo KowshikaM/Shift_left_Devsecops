@@ -2,9 +2,9 @@
 
 A local, demo-ready DevSecOps control center that turns a GitHub push into an enforced security decision:
 
-**GitHub → Jenkins → Semgrep/Gitleaks → Docker build → Trivy → OPA/Conftest → Security Gate → Dashboard → Docker Hub → kind/minikube**
+**GitHub → Jenkins → Application Tests → Semgrep/Gitleaks → Docker build → Trivy → OPA/Conftest → Security Gate → Dashboard → Docker Hub → kind/minikube**
 
-A failed build is retained in dashboard history. A passing build is the only build allowed to push and deploy. AI remediation is human-triggered, validated by Jenkins, and opened as a PR; it never merges or deploys.
+A failed build is retained in dashboard history. Only a passing build on `main` may push or deploy. AI remediation is human-triggered, validated by Jenkins, and opened as a PR; it never merges or deploys.
 
 ## Current implementation
 
@@ -14,14 +14,15 @@ A failed build is retained in dashboard history. A passing build is the only bui
 - Real containerized scanners: Semgrep, Gitleaks, Trivy and OPA/Conftest.
 - Central gate blocks on CRITICAL/HIGH findings and on missing/invalid scanner evidence or scanner execution errors.
 - Docker Hub receives only an immutable build-number tag; `latest` is not pushed or deployed.
-- Kubernetes deployment uses the exact registry image tag produced by the passing build.
-- AI provider adapter: **OpenAI primary, Groq fallback**. Groq uses its OpenAI-compatible endpoint. Both credentials stay in Jenkins.
-- AI never handles Gitleaks secret content. AI changes are restricted to `app/`, `k8s/`, and `Dockerfile`.
-- AI fixes are validated by the same gate before a branch is pushed and a GitHub PR is created.
+- Kubernetes deployment uses the exact registry image tag produced by a passing `main` build; feature and AI-remediation branches cannot push or deploy.
+- Groq is the only AI provider. The model is selected with `GROQ_MODEL`; the API key is stored as the Jenkins credential `groq-api-key`.
+- Only LOW and MEDIUM non-secret findings are AI-eligible. HIGH, CRITICAL, Gitleaks, and secret-like findings require manual review.
+- Python controls the AI workflow: scanner baseline, structured proposal validation, one-file unified patch, project tests, complete rescan, before/after comparison, rollback on failure, and isolated commit on success.
+- The AI workflow creates a branch and PR only after validation. It never merges or deploys. The normal main pipeline gate still controls deployment.
 - Human review/merge remains mandatory.
 - Manual remediation remains available when AI is unavailable.
 
-OpenAI documents API keys as environment-managed credentials; Groq documents the OpenAI-compatible base URL `https://api.groq.com/openai/v1`. See the project notes below for the exact Jenkins credential IDs.
+Groq uses its OpenAI-compatible Chat Completions endpoint at `https://api.groq.com/openai/v1`. The key is provided only through Jenkins credentials and is never written to the repository.
 
 ## Project structure
 
@@ -36,9 +37,13 @@ secure-devops-pipeline/
 │   ├── publish_to_dashboard.py # persistent dashboard ingestion
 │   ├── generate_dashboard.py   # Jenkins archived HTML report
 │   ├── create_remediation_tickets.py
-│   ├── ai_fix_single.py        # OpenAI/Groq remediation adapter
+│   ├── classify_remediations.py # writes this build's eligibility report
+│   ├── remediation_policy.py   # import shim to shared dashboard policy
+│   ├── ai_remediation_agent.py # deterministic controller and validation tools
+│   ├── groq_client.py          # Groq-only structured proposal client
+│   ├── ai_fix_single.py        # compatibility entry point
 │   └── create_ai_pr.py         # creates PR only after validation
-├── dashboard-service/          # live dashboard + API + SQLite volume
+├── dashboard-service/          # live dashboard + API + shared policy + SQLite volume
 ├── docker-compose.yml
 ├── Jenkinsfile                 # main Windows Jenkins pipeline
 └── Jenkinsfile.single-fix      # parameterized AI remediation job
@@ -52,8 +57,7 @@ Use these exact IDs:
 |---|---|---|
 | `github-token` | Secret text | GitHub PAT |
 | `dockerhub-creds` | Username + password | Docker Hub username + access token |
-| `openai-api-key` | Secret text | OpenAI AI remediation |
-| `groq-api-key` | Secret text | Groq fallback remediation |
+| `groq-api-key` | Secret text | Groq AI remediation |
 
 The repository is configured as `KowshikaM/Shift_left_Devsecops` and the Docker Hub namespace as `kowshika8`.
 
@@ -69,14 +73,13 @@ cd "secure-devops-pipeline"
 
 ### 2. Configure the dashboard → Jenkins connection
 
-Open `docker-compose.yml` and replace only:
+Copy the sample and set your Jenkins account name and a newly generated Jenkins API token in the local, ignored `.env` file:
 
-```yaml
-JENKINS_USER: "REPLACE_WITH_YOUR_JENKINS_USERNAME"
-JENKINS_API_TOKEN: "REPLACE_WITH_YOUR_JENKINS_API_TOKEN"
+```powershell
+Copy-Item .env.example .env
 ```
 
-Do not put OpenAI, Groq, GitHub or Docker Hub secrets in this file.
+Never commit `.env`. The old API token that was previously present in Compose should be revoked and replaced because removing it from the current file does not remove it from Git history. Do not put the Groq, GitHub, or Docker Hub secrets in `.env`.
 
 Because Jenkins is running directly on Windows and the dashboard runs in Docker, the compose file already uses:
 
@@ -134,6 +137,8 @@ docker --version
 python --version
 git --version
 kubectl version --client
+node --version
+npm --version
 ```
 
 Docker Desktop must be running.
@@ -219,20 +224,18 @@ From an open ticket, click:
 
 The dashboard triggers `ai-single-fix`.
 
-The job:
+The API independently enforces LOW/MEDIUM non-secret eligibility; a forged request for HIGH/CRITICAL is rejected. The existing `ai-single-fix` job then:
 
-1. Checks out the vulnerable commit.
-2. Calls OpenAI first.
-3. Falls back to Groq if OpenAI is unavailable.
-4. Never sends Gitleaks secret findings to an AI provider.
-5. Restricts AI changes to the allowed project files.
-6. Runs Semgrep, Gitleaks, Trivy and OPA/Conftest again.
-7. Runs the centralized Security Gate.
-8. Stops if the fix still fails.
-9. Only after a PASS does it create a new branch and push it.
-10. Creates a GitHub PR.
-11. Calls the dashboard back with the explanation and PR URL.
-12. Human reviews and merges the PR.
+1. Checks out the finding's repository revision and runs full baseline scans.
+2. Confirms the requested finding and severity against fresh scanner output.
+3. Sends Groq the scanner metadata, project context, and affected file only.
+4. Validates the structured proposal and a unified diff restricted to that one file.
+5. Creates an isolated `ai-remediation/` branch and applies the validated diff.
+6. Runs the Node application tests, then rebuilds and runs Semgrep, Gitleaks, Trivy, and both OPA/Conftest checks again.
+7. Compares before/after results; if tests fail, scans fail, the target remains, or new findings appear, it restores the original file and marks the ticket for manual review.
+8. If checks pass, commits only the approved file, pushes the branch, and opens a PR for human review.
+
+This job's PASS means the requested finding was validated and is ready for PR review. It does not authorize deployment. The main pipeline's complete Security Gate remains required for image publishing and Kubernetes deployment.
 
 There is no automatic merge and no AI deployment.
 
@@ -260,6 +263,21 @@ Verify:
 kubectl get pods -n devsecops-demo
 kubectl get svc -n devsecops-demo
 kubectl get deployment -n devsecops-demo
+```
+
+### 12. Tests
+
+Run the application smoke tests in a local Node environment after installing its dependencies:
+
+```powershell
+npm install --prefix app
+npm test --prefix app
+```
+
+Run the Python policy, scanner-normalization, patch-control, and dashboard authorization tests:
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
 The dashboard should retain both the failed and successful build.

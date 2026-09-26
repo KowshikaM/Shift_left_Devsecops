@@ -1,4 +1,3 @@
-@"
 # Environment and secrets
 .env
 .env.*
@@ -7,32 +6,33 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
 .venv/
 venv/
 ENV/
 *.egg-info/
 
-# Node / React
+# Node
 node_modules/
 npm-debug.log*
-yarn-debug.log*
-pnpm-debug.log*
-dist/
-build/
 
 # Local databases
 *.db
 *.sqlite
 *.sqlite3
 
-# Jenkins / generated reports
+# Jenkins and generated reports
 workspace/
 *.log
 dashboard/report.html
 dashboard/*.json
+ai-remediation-candidates.json
+.ai-remediation/
+.ai-fix-result.json
+ai-validation-result.json
+ai-pr.env
+ai-branch.txt
 
-# Security scanner generated results
+# Scanner reports
 semgrep-results.json
 gitleaks-results.json
 trivy-results.json
@@ -45,11 +45,6 @@ k8s-policy-results.json
 *.swp
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
 .idea/
-
-# OS
 Desktop.ini
-"@ | Set-Content .gitignore

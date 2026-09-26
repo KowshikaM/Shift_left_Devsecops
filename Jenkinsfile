@@ -43,6 +43,28 @@ pipeline {
             }
         }
 
+        stage('Test Application') {
+            steps {
+                script {
+                    env.PIPELINE_STAGE = 'Application Tests'
+                    env.PIPELINE_STATUS = 'RUNNING'
+                }
+
+                powershell '''
+                    & docker run --rm `
+                      -v "${env:WORKSPACE}:/workspace" `
+                      --mount "type=volume,target=/workspace/app/node_modules" `
+                      -w /workspace/app `
+                      node:18 `
+                      sh -lc "npm install --no-save --package-lock=false && npm test"
+
+                    if ($LASTEXITCODE -ne 0) {
+                        exit $LASTEXITCODE
+                    }
+                '''
+            }
+        }
+
         stage('SAST - Semgrep') {
             steps {
                 script {
@@ -145,10 +167,9 @@ pipeline {
                       image `
                       --input /out/trivy-image.tar `
                       --format json `
-                      --severity CRITICAL,HIGH,MEDIUM `
+                      --severity CRITICAL,HIGH,MEDIUM,LOW `
                       --timeout 10m `
-                      1> trivy-results.json `
-                      2> trivy-console.log
+                      --output /out/trivy-results.json
 
                     $code = $LASTEXITCODE
 
@@ -180,7 +201,7 @@ pipeline {
                       /project/Dockerfile `
                       --policy /project/policy `
                       --output json |
-                      Set-Content dockerfile-policy-results.json
+                      Out-File -FilePath dockerfile-policy-results.json -Encoding utf8
 
                     $dockerCode = $LASTEXITCODE
 
@@ -194,7 +215,7 @@ pipeline {
                       /project/k8s/deployment.yaml `
                       --policy /project/policy `
                       --output json |
-                      Set-Content k8s-policy-results.json
+                      Out-File -FilePath k8s-policy-results.json -Encoding utf8
 
                     $k8sCode = $LASTEXITCODE
 
@@ -211,6 +232,25 @@ pipeline {
 
                     exit 0
                 '''
+            }
+        }
+
+        stage('Classify Remediation Eligibility') {
+            steps {
+                script {
+                    env.PIPELINE_STAGE = 'Classifying Remediation Eligibility'
+                    env.PIPELINE_STATUS = 'RUNNING'
+                }
+
+                powershell '''
+                    python scripts/classify_remediations.py
+
+                    if ($LASTEXITCODE -ne 0) {
+                        exit $LASTEXITCODE
+                    }
+                '''
+
+                archiveArtifacts artifacts: 'ai-remediation-candidates.json', allowEmptyArchive: true
             }
         }
 
@@ -309,7 +349,9 @@ pipeline {
         stage('Push Immutable Image') {
             when {
                 expression {
-                    return fileExists('gate-status.txt') &&
+                    def sourceBranch = (env.GIT_BRANCH ?: env.BRANCH_NAME ?: '').replaceFirst(/^origin\//, '')
+                    return sourceBranch == 'main' &&
+                            fileExists('gate-status.txt') &&
                             readFile('gate-status.txt').trim().toUpperCase() == 'PASS'
                 }
             }
@@ -361,7 +403,9 @@ pipeline {
         stage('Deploy to kind/minikube') {
             when {
                 expression {
-                    return fileExists('gate-status.txt') &&
+                    def sourceBranch = (env.GIT_BRANCH ?: env.BRANCH_NAME ?: '').replaceFirst(/^origin\//, '')
+                    return sourceBranch == 'main' &&
+                            fileExists('gate-status.txt') &&
                             readFile('gate-status.txt').trim().toUpperCase() == 'PASS'
                 }
             }
@@ -418,7 +462,9 @@ pipeline {
         stage('Record Deployment') {
             when {
                 expression {
-                    return fileExists('gate-status.txt') &&
+                    def sourceBranch = (env.GIT_BRANCH ?: env.BRANCH_NAME ?: '').replaceFirst(/^origin\//, '')
+                    return sourceBranch == 'main' &&
+                            fileExists('gate-status.txt') &&
                             readFile('gate-status.txt').trim().toUpperCase() == 'PASS' &&
                             env.DEPLOYED == '1'
                 }

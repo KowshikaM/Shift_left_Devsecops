@@ -56,9 +56,29 @@
     </div>
   </div>
 
+  <dialog id="remediation-dialog" class="remediation-dialog" aria-labelledby="remediation-title">
+    <div class="guide-header">
+      <div class="guide-heading">
+        <div class="guide-eyebrow">
+          <span>SECURITY REMEDIATION</span>
+          <span id="guide-severity" class="guide-severity"></span>
+        </div>
+        <h2 id="remediation-title">Remediation guide</h2>
+        <p id="guide-finding-title" class="guide-finding-title"></p>
+        <div id="guide-location" class="guide-location"></div>
+      </div>
+      <button class="guide-close" type="button" data-close-guide aria-label="Close guide" title="Close guide">&#215;</button>
+    </div>
+    <div id="remediation-guide-content" class="guide-sections"></div>
+    <div class="guide-footer">
+      <p>Run the relevant checks and confirm the security gate passes before merging.</p>
+      <button class="btn btn-primary" type="button" data-close-guide>Done</button>
+    </div>
+  </dialog>
+
   <footer>
     <span>Secure DevOps Pipeline &mdash; persistent build history stored locally</span>
-    <span>Semgrep &middot; Gitleaks &middot; Trivy &middot; OPA/Conftest &middot; OpenAI/Groq</span>
+    <span>Semgrep &middot; Gitleaks &middot; Trivy &middot; OPA/Conftest &middot; Groq</span>
   </footer>
 
 </div>

@@ -1,810 +1,197 @@
-// AI Single-Fix — separate parameterized Jenkins job
+// Existing parameterized AI remediation job, controlled by the Python agent.
 
 pipeline {
     agent any
 
     parameters {
-        string(
-            name: 'FILE_PATH',
-            defaultValue: '',
-            description: 'Finding file path'
-        )
-
-        string(
-            name: 'RULE_ID',
-            defaultValue: '',
-            description: 'Scanner rule/CVE'
-        )
-
-        string(
-            name: 'MESSAGE',
-            defaultValue: '',
-            description: 'Finding message'
-        )
-
-        string(
-            name: 'SOURCE',
-            defaultValue: '',
-            description: 'Scanner source'
-        )
-
-        string(
-            name: 'TICKET_ID',
-            defaultValue: '',
-            description: 'Dashboard finding ID'
-        )
-
-        string(
-            name: 'DASHBOARD_CALLBACK_URL',
-            defaultValue: 'http://localhost:2001',
-            description: 'Dashboard callback URL'
-        )
+        string(name: 'FILE_PATH', defaultValue: '', description: 'Scanner-reported file path')
+        string(name: 'RULE_ID', defaultValue: '', description: 'Scanner rule or vulnerability ID')
+        string(name: 'MESSAGE', defaultValue: '', description: 'Scanner finding description')
+        string(name: 'SOURCE', defaultValue: '', description: 'Scanner source')
+        string(name: 'SEVERITY', defaultValue: '', description: 'Finding severity; only LOW/MEDIUM are eligible')
+        string(name: 'GROQ_MODEL', defaultValue: 'openai/gpt-oss-20b', description: 'Groq model ID')
+        string(name: 'VULNERABILITY_ID', defaultValue: '', description: 'CVE or scanner finding ID')
+        string(name: 'PACKAGE_NAME', defaultValue: '', description: 'Affected package, when available')
+        string(name: 'INSTALLED_VERSION', defaultValue: '', description: 'Installed package version, when available')
+        string(name: 'FIXED_VERSION', defaultValue: '', description: 'Scanner-recommended fixed version, when available')
+        string(name: 'TICKET_ID', defaultValue: '', description: 'Dashboard finding ID')
+        string(name: 'DASHBOARD_CALLBACK_URL', defaultValue: 'http://localhost:2001', description: 'Dashboard callback URL')
     }
 
     environment {
         GITHUB_REPOSITORY = 'KowshikaM/Shift_left_Devsecops'
-        DASHBOARD_URL = "${params.DASHBOARD_CALLBACK_URL}"
-        IMAGE_NAME = 'secure-devops-demo'
-        KUBE_CONTEXT = 'kind-kind'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
     }
 
     stages {
-
-        // ============================================================
-        // CHECKOUT
-        // ============================================================
-
         stage('Checkout') {
             steps {
                 checkout scm
             }
         }
 
-        // ============================================================
-        // AI GENERATE PATCH
-        // ============================================================
-
         stage('AI Generate Patch') {
             steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'openai-api-key',
-                        variable: 'OPENAI_API_KEY'
-                    ),
-                    string(
-                        credentialsId: 'groq-api-key',
-                        variable: 'GROQ_API_KEY'
-                    )
-                ]) {
-                    powershell '''
-                        Write-Host "Groq key loaded: $([string]::IsNullOrEmpty($env:GROQ_API_KEY) -eq $false)"
-                        Write-Host "Groq key length: $($env:GROQ_API_KEY.Length)"
-                        Write-Host "Groq key prefix: $($env:GROQ_API_KEY.Substring(0,4))"
-
-                        python scripts/ai_fix_single.py `
+                withCredentials([string(credentialsId: 'groq-api-key', variable: 'GROQ_API_KEY')]) {
+                    withEnv(["GROQ_MODEL=${params.GROQ_MODEL}"]) {
+                        powershell '''
+                        python scripts/ai_remediation_agent.py `
                           --file "$env:FILE_PATH" `
                           --rule "$env:RULE_ID" `
                           --message "$env:MESSAGE" `
+                          --source "$env:SOURCE" `
+                          --severity "$env:SEVERITY" `
+                          --vulnerability-id "$env:VULNERABILITY_ID" `
+                          --package-name "$env:PACKAGE_NAME" `
+                          --installed-version "$env:INSTALLED_VERSION" `
+                          --fixed-version "$env:FIXED_VERSION" `
                           --ticket-id "$env:TICKET_ID"
 
                         if ($LASTEXITCODE -ne 0) {
                             exit $LASTEXITCODE
                         }
-                    '''
+                        '''
+                    }
                 }
             }
         }
-
-        // ============================================================
-        // SEMGREP VALIDATION
-        // ============================================================
 
         stage('Validate AI Patch — Semgrep') {
             steps {
                 powershell '''
-                    $ErrorActionPreference = "Continue"
-
-                    $aiResult = Get-Content ".ai-fix-result.json" |
-                        ConvertFrom-Json
-
-                    $targetFile = $aiResult.file
-
-                    if ([string]::IsNullOrWhiteSpace($targetFile)) {
-                        Write-Host "AI result does not contain a target file."
-                        exit 2
+                    $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
+                    if ($result.status -eq "PASS") {
+                        if (!(Test-Path ".ai-remediation/after/semgrep-results.json")) {
+                            throw "Post-remediation Semgrep evidence is missing."
+                        }
+                        Write-Host "Semgrep post-remediation scan completed by the Python controller."
+                    } else {
+                        Write-Host "Agent stopped safely; Semgrep was not reported as passed."
                     }
-
-                    $targetFile = $targetFile.Replace("\\","/").TrimStart("./")
-
-                    Write-Host "Semgrep target (AI-modified file only): $targetFile"
-
-                    New-Item `
-                        -ItemType Directory `
-                        -Force `
-                        -Path ".scan-status" |
-                        Out-Null
-
-                    '[]' | Set-Content "dockerfile-policy-results.json"
-                    '[]' | Set-Content "k8s-policy-results.json"
-
-                    docker run --rm `
-                      -v "${env:WORKSPACE}:/src" `
-                      returntocorp/semgrep `
-                      semgrep scan `
-                      --config p/owasp-top-ten `
-                      --config p/javascript `
-                      --json `
-                      --output "/src/semgrep-results.json" `
-                      "/src/$targetFile" `
-                      *> semgrep-console.log
-
-                    $code = $LASTEXITCODE
-
-                    Write-Host "Semgrep exit code: $code"
-
-                    if (!(Test-Path "semgrep-results.json")) {
-                        '{}' | Set-Content "semgrep-results.json"
-                    }
-
-                    if ($code -ge 2) {
-                        '2' | Set-Content ".scan-status/semgrep.status"
-
-                        Write-Host "Semgrep execution failed."
-                        Get-Content semgrep-console.log
-
-                        # Do not abort the pipeline here.
-                        # Security Gate will fail and the dashboard
-                        # will still receive the validation result.
-                        exit 0
-                    }
-
-                    if ($code -eq 1) {
-                        '1' | Set-Content ".scan-status/semgrep.status"
-
-                        Write-Host "Semgrep found findings."
-                    }
-                    else {
-                        '0' | Set-Content ".scan-status/semgrep.status"
-
-                        Write-Host "Semgrep found no findings."
-                    }
-
-                    exit 0
                 '''
             }
         }
-
-        // ============================================================
-        // GITLEAKS VALIDATION
-        // ============================================================
 
         stage('Validate AI Patch — Gitleaks') {
             steps {
                 powershell '''
-                    $ErrorActionPreference = "Continue"
-
-                    $aiResult = Get-Content ".ai-fix-result.json" |
-                        ConvertFrom-Json
-
-                    $targetFile = $aiResult.file
-
-                    if ([string]::IsNullOrWhiteSpace($targetFile)) {
-                        Write-Host "AI result does not contain a target file."
-                        exit 2
+                    $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
+                    if ($result.status -eq "PASS") {
+                        if (!(Test-Path ".ai-remediation/after/gitleaks-results.json")) {
+                            throw "Post-remediation Gitleaks evidence is missing."
+                        }
+                        Write-Host "Gitleaks post-remediation scan completed by the Python controller."
+                    } else {
+                        Write-Host "Agent stopped safely; Gitleaks was not reported as passed."
                     }
-
-                    $targetFile = $targetFile.Replace("\\","/").TrimStart("./")
-
-                    Write-Host "Gitleaks target (AI-modified file only): $targetFile"
-
-                    New-Item `
-                        -ItemType Directory `
-                        -Force `
-                        -Path ".scan-status" |
-                        Out-Null
-
-                    docker run --rm `
-                      -v "${env:WORKSPACE}:/repo" `
-                      zricethezav/gitleaks:latest `
-                      detect `
-                      --source "/repo/$targetFile" `
-                      --no-git `
-                      --report-format json `
-                      --report-path "/repo/gitleaks-results.json" `
-                      *> gitleaks-console.log
-
-                    $code = $LASTEXITCODE
-
-                    Write-Host "Gitleaks exit code: $code"
-
-                    if (!(Test-Path "gitleaks-results.json")) {
-                        '[]' | Set-Content "gitleaks-results.json"
-                    }
-
-                    if ($code -ge 2) {
-                        '2' | Set-Content ".scan-status/gitleaks.status"
-
-                        Write-Host "Gitleaks execution failed."
-                        Get-Content gitleaks-console.log
-
-                        # Let Security Gate handle the failure so that
-                        # dashboard validation still executes.
-                        exit 0
-                    }
-
-                    if ($code -eq 1) {
-                        '1' | Set-Content ".scan-status/gitleaks.status"
-
-                        Write-Host "Gitleaks found potential secrets."
-                    }
-                    else {
-                        '0' | Set-Content ".scan-status/gitleaks.status"
-
-                        Write-Host "Gitleaks found no secrets."
-                    }
-
-                    exit 0
                 '''
             }
         }
-
-        // ============================================================
-        // DOCKER / TRIVY / OPA VALIDATION
-        // ============================================================
 
         stage('Validate AI Patch — Docker/Trivy/OPA') {
             steps {
                 powershell '''
-                    $ErrorActionPreference = "Continue"
-
-                    $aiResult = Get-Content ".ai-fix-result.json" |
-                        ConvertFrom-Json
-
-                    $targetFile = $aiResult.file
-
-                    if ([string]::IsNullOrWhiteSpace($targetFile)) {
-                        Write-Host "AI result does not contain a target file."
-                        exit 2
-                    }
-
-                    $targetFile = $targetFile.Replace("\\","/").TrimStart("./")
-
-                    Write-Host "AI-modified file: $targetFile"
-
-                    New-Item `
-                        -ItemType Directory `
-                        -Force `
-                        -Path ".scan-status" |
-                        Out-Null
-
-                    # ------------------------------------------------
-                    # Docker Build
-                    # ------------------------------------------------
-
-                    $imageTag = "ai-$($env:BUILD_NUMBER)"
-                    $imageRef = "{0}:{1}" -f $env:IMAGE_NAME, $imageTag
-
-                    Write-Host "Building patched image: $imageRef"
-
-                    docker build --tag $imageRef .
-
-                    if ($LASTEXITCODE -ne 0) {
-                        '2' | Set-Content ".scan-status/trivy.status"
-
-                        Write-Host "Docker build failed."
-
-                        # Continue to Security Gate so the dashboard
-                        # can receive the validation result.
-                        exit 0
-                    }
-
-                    # ------------------------------------------------
-                    # Save image for Trivy
-                    # ------------------------------------------------
-
-                    $trivyTar = Join-Path $env:WORKSPACE "trivy-image.tar"
-
-                    Write-Host "Trivy image tar path: $trivyTar"
-
-                    docker save `
-                      $imageRef `
-                      -o $trivyTar
-
-                    if ($LASTEXITCODE -ne 0) {
-                        '2' | Set-Content ".scan-status/trivy.status"
-
-                        Write-Host "docker save failed."
-
-                        exit 0
-                    }
-
-                    # ------------------------------------------------
-                    # Trivy
-                    # ------------------------------------------------
-
-                    docker run --rm `
-                      -v "${env:WORKSPACE}:/out" `
-                      aquasec/trivy:latest `
-                      image `
-                      --input /out/trivy-image.tar `
-                      --format json `
-                      --output /out/trivy-results.json `
-                      --severity CRITICAL,HIGH,MEDIUM `
-                      --timeout 10m `
-                      *> trivy-console.log
-
-                    $trivyCode = $LASTEXITCODE
-
-                    Write-Host "Trivy exit code: $trivyCode"
-
-                    if (!(Test-Path "trivy-results.json")) {
-                        '{}' | Set-Content "trivy-results.json"
-                    }
-
-                    if ($trivyCode -ge 2) {
-                        '2' | Set-Content ".scan-status/trivy.status"
-
-                        Write-Host "Trivy execution failed."
-                        Get-Content trivy-console.log
-
-                        exit 0
-                    }
-
-                    # Trivy execution succeeded.
-                    # evaluate_gate.py evaluates the actual contents
-                    # of trivy-results.json.
-                    '0' | Set-Content ".scan-status/trivy.status"
-
-                    # ------------------------------------------------
-                    # Dockerfile OPA / Conftest
-                    # ------------------------------------------------
-
-                    if ($targetFile -eq "Dockerfile") {
-
-                        docker run --rm `
-                          -v "${env:WORKSPACE}:/project" `
-                          openpolicyagent/conftest `
-                          test /project/Dockerfile `
-                          --policy /project/policy `
-                          --output json `
-                          > dockerfile-policy-results.json `
-                          2> dockerfile-policy-console.log
-
-                        $d = $LASTEXITCODE
-
-                        if ($d -ge 2) {
-                            '2' | Set-Content ".scan-status/docker-policy.status"
-
-                            Write-Host "Dockerfile policy execution failed."
-                            Get-Content dockerfile-policy-console.log
-
-                            exit 0
+                    $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
+                    if ($result.status -eq "PASS") {
+                        $reports = @(
+                            ".ai-remediation/after/trivy-results.json",
+                            ".ai-remediation/after/dockerfile-policy-results.json",
+                            ".ai-remediation/after/k8s-policy-results.json"
+                        )
+                        foreach ($report in $reports) {
+                            if (!(Test-Path $report)) { throw "Post-remediation evidence missing: $report" }
                         }
-
-                        if ($d -eq 1) {
-                            '1' | Set-Content ".scan-status/docker-policy.status"
-
-                            Write-Host "Dockerfile policy violations found."
-                        }
-                        else {
-                            '0' | Set-Content ".scan-status/docker-policy.status"
-
-                            Write-Host "Dockerfile policy passed."
-                        }
+                        Write-Host "Trivy and both OPA/Conftest post-remediation scans completed by the Python controller."
+                    } else {
+                        Write-Host "Agent stopped safely; container/policy scans were not reported as passed."
                     }
-                    else {
-                        '0' | Set-Content ".scan-status/docker-policy.status"
-                    }
-
-                    # ------------------------------------------------
-                    # Kubernetes OPA / Conftest
-                    # ------------------------------------------------
-
-                    if ($targetFile -like "k8s/*") {
-
-                        docker run --rm `
-                          -v "${env:WORKSPACE}:/project" `
-                          openpolicyagent/conftest `
-                          test "/project/$targetFile" `
-                          --policy /project/policy `
-                          --output json `
-                          > k8s-policy-results.json `
-                          2> k8s-policy-console.log
-
-                        $k = $LASTEXITCODE
-
-                        if ($k -ge 2) {
-                            '2' | Set-Content ".scan-status/k8s-policy.status"
-
-                            Write-Host "Kubernetes policy execution failed."
-                            Get-Content k8s-policy-console.log
-
-                            exit 0
-                        }
-
-                        if ($k -eq 1) {
-                            '1' | Set-Content ".scan-status/k8s-policy.status"
-
-                            Write-Host "Kubernetes policy violations found."
-                        }
-                        else {
-                            '0' | Set-Content ".scan-status/k8s-policy.status"
-
-                            Write-Host "Kubernetes policy passed."
-                        }
-                    }
-                    else {
-                        '0' | Set-Content ".scan-status/k8s-policy.status"
-                    }
-
-                    # ------------------------------------------------
-                    # Cleanup
-                    # ------------------------------------------------
-
-                    Remove-Item `
-                        "trivy-image.tar" `
-                        -Force `
-                        -ErrorAction SilentlyContinue
-
-                    Write-Host "Docker/Trivy/OPA validation completed."
-
-                    exit 0
                 '''
             }
         }
-
-        // ============================================================
-        // SECURITY GATE
-        // ============================================================
 
         stage('Security Gate') {
             steps {
                 powershell '''
-                    $ErrorActionPreference = "Continue"
-
-                    # Make sure the status directory exists.
-                    if (!(Test-Path ".scan-status")) {
-
-                        Write-Host "Scanner status directory is missing."
-
-                        "FAIL" | Set-Content "gate-status.txt"
-
-                        @{
-                            status = "FAIL"
-                            validation_summary = "Scanner status directory is missing; gate=FAIL"
-                            explanation = "AI patch validation could not be completed because scanner status files were missing."
-                        } |
-                        ConvertTo-Json -Depth 5 |
-                        Set-Content "ai-validation-result.json"
-
-                        # Continue so dashboard ticket can be updated.
-                        exit 0
-                    }
-
-                    Write-Host ""
-                    Write-Host "========================================"
-                    Write-Host "Actual scanner statuses"
-                    Write-Host "========================================"
-
-                    Get-ChildItem ".scan-status" | ForEach-Object {
-                        Write-Host "$($_.Name): $((Get-Content $_.FullName -Raw).Trim())"
-                    }
-
-                    Write-Host ""
-                    Write-Host "Running authoritative Security Gate..."
-
-                    python scripts/evaluate_gate.py
-
-                    $gateCode = $LASTEXITCODE
-
-                    if ($gateCode -eq 0) {
-                        $gateStatus = "PASS"
-                    }
-                    else {
-                        $gateStatus = "FAIL"
-                    }
-
-                    $summaryParts = @()
-
-                    Get-ChildItem ".scan-status" | ForEach-Object {
-                        $summaryParts += "$($_.Name)=$((Get-Content $_.FullName -Raw).Trim())"
-                    }
-
-                    $summary = ($summaryParts -join "; ") + "; gate=$gateStatus"
-
-                    # ------------------------------------------------
-                    # Persist ACTUAL validation result
-                    # ------------------------------------------------
-
-                    @{
-                        status = $gateStatus
-                        validation_summary = $summary
-                        explanation = "AI patch validated by Jenkins: $gateStatus; scanner statuses: $summary"
-                    } |
-                    ConvertTo-Json -Depth 5 |
-                    Set-Content "ai-validation-result.json"
-
-                    # ------------------------------------------------
-                    # Persist gate status for later stages
-                    # ------------------------------------------------
-
-                    $gateStatus | Set-Content "gate-status.txt"
-
-                    Write-Host ""
-                    Write-Host "========================================"
-                    Write-Host "Security Gate: $gateStatus"
-                    Write-Host "========================================"
-
-                    # IMPORTANT:
-                    #
-                    # We deliberately return 0 here so Jenkins can execute
-                    # the dashboard validation update stage.
-                    #
-                    # This DOES NOT mean the security gate passed.
-                    #
-                    # The real decision is stored in:
-                    #
-                    #   gate-status.txt
-                    #   ai-validation-result.json
-                    #
-                    # The PR stages are allowed only when gate-status.txt
-                    # contains PASS.
-
-                    exit 0
+                    $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
+                    $result.status | Set-Content "gate-status.txt"
+                    Write-Host "Remediation verification status: $($result.status)"
+                    Write-Host "Test status: $($result.test_status)"
+                    Write-Host "Rescan status: $($result.rescan_status)"
+                    Write-Host "Main release gate remains enforced by the secure-devops-pipeline job."
                 '''
             }
         }
-
-        // ============================================================
-        // UPDATE EXISTING DASHBOARD TICKET
-        // ============================================================
 
         stage('Update Ticket Validation Status') {
             steps {
                 powershell '''
-                    $ErrorActionPreference = "Stop"
-
-                    if (!(Test-Path "ai-validation-result.json")) {
-
-                        Write-Host "Validation result file is missing."
-
-                        exit 1
-                    }
-
-                    $payload = Get-Content `
-                        "ai-validation-result.json" `
-                        -Raw
-
-                    if ([string]::IsNullOrWhiteSpace($payload)) {
-
-                        Write-Host "Validation result is empty."
-
-                        exit 1
-                    }
-
-                    $callback = "$env:DASHBOARD_CALLBACK_URL"
-
-                    if ([string]::IsNullOrWhiteSpace($callback)) {
-
-                        Write-Host "Dashboard callback URL is missing."
-
-                        exit 1
-                    }
-
-                    Write-Host "Updating dashboard ticket validation for ticket #$env:TICKET_ID"
-
-                    python -c "import json, os, urllib.request; payload=json.load(open('ai-validation-result.json', encoding='utf-8')); url=os.environ['DASHBOARD_CALLBACK_URL'].rstrip('/') + '/api/tickets/' + os.environ['TICKET_ID'] + '/validation-result'; req=urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), method='POST'); req.add_header('Content-Type','application/json'); urllib.request.urlopen(req, timeout=10); print('[validation] ticket updated')"
-
-                    if ($LASTEXITCODE -ne 0) {
-
-                        Write-Host "Dashboard validation update failed."
-
-                        exit $LASTEXITCODE
-                    }
-
-                    Write-Host "Dashboard ticket validation updated successfully."
+                    python -c "import json, os, urllib.request; payload=json.load(open('.ai-fix-result.json', encoding='utf-8')); url=os.environ['DASHBOARD_CALLBACK_URL'].rstrip('/') + '/api/tickets/' + os.environ['TICKET_ID'] + '/validation-result'; req=urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), method='POST'); req.add_header('Content-Type','application/json'); urllib.request.urlopen(req, timeout=10); print('[AGENT] Dashboard ticket updated')"
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                 '''
             }
         }
 
-        // ============================================================
-        // CREATE VALIDATED BRANCH AND PR
-        // ONLY AFTER SECURITY GATE PASSES
-        // ============================================================
-
         stage('Create Validated Branch and PR') {
-
             when {
-                expression {
-                    return (
-                        fileExists('gate-status.txt') &&
-                        readFile('gate-status.txt').trim() == 'PASS'
-                    )
-                }
+                expression { return fileExists('gate-status.txt') && readFile('gate-status.txt').trim() == 'PASS' }
             }
-
             steps {
-
-                withCredentials([
-                    string(
-                        credentialsId: 'github-token',
-                        variable: 'GITHUB_TOKEN'
-                    )
-                ]) {
-
+                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
                     powershell '''
-                        $result = Get-Content ".ai-fix-result.json" |
-                            ConvertFrom-Json
-
-                        $branch = "ai-fix-ticket-$env:TICKET_ID-$($env:GIT_COMMIT.Substring(0,8))"
-
-                        Write-Host "Creating validated branch: $branch"
-
-                        git config user.name "security-bot"
-
-                        git config user.email "security-bot@users.noreply.github.com"
-
-                        git checkout -b $branch
-
-                        git add -- $env:FILE_PATH
-
-                        git commit `
-                          -m "fix: AI remediation for ticket #$env:TICKET_ID"
-
-                        if ($LASTEXITCODE -ne 0) {
-                            exit $LASTEXITCODE
+                        $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
+                        $branch = [string]$result.branch
+                        if ($branch -notmatch '^ai-remediation/ticket-[0-9]+-[0-9]+$') {
+                            throw "Agent returned an invalid isolated branch name."
                         }
-
-                        # Use the Jenkins GitHub token explicitly.
-                        git -c "http.extraheader=AUTHORIZATION: bearer $env:GITHUB_TOKEN" `
-                            push -u origin $branch
-
-                        if ($LASTEXITCODE -ne 0) {
-                            exit $LASTEXITCODE
-                        }
-
-                        "AI_BRANCH=$branch" |
-                            Out-File `
-                                -FilePath ai-pr.env `
-                                -Encoding ascii
-
-                        "AI_EXPLANATION=$($result.explanation)" |
-                            Add-Content ai-pr.env
-
-                        "AI_PROVIDER=$($result.provider)" |
-                            Add-Content ai-pr.env
-
-                        Write-Host "Validated branch pushed successfully."
+                        git -c "http.extraheader=AUTHORIZATION: bearer $env:GITHUB_TOKEN" push -u origin $branch
+                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                        $branch | Set-Content "ai-branch.txt"
                     '''
                 }
-
                 script {
-
-                    def vars = readFile('ai-pr.env').readLines()
-
-                    vars.each { line ->
-
-                        def i = line.indexOf('=')
-
-                        if (i > 0) {
-
-                            env[line.substring(0, i)] =
-                                line.substring(i + 1)
-                        }
-                    }
+                    env.AI_BRANCH = readFile('ai-branch.txt').trim()
                 }
             }
         }
-
-        // ============================================================
-        // OPEN GITHUB PR
-        // ONLY AFTER SECURITY GATE PASSES
-        // ============================================================
 
         stage('Open GitHub PR') {
-
             when {
-                expression {
-                    return (
-                        fileExists('gate-status.txt') &&
-                        readFile('gate-status.txt').trim() == 'PASS'
-                    )
-                }
+                expression { return fileExists('gate-status.txt') && readFile('gate-status.txt').trim() == 'PASS' }
             }
-
             steps {
-
-                withCredentials([
-                    string(
-                        credentialsId: 'github-token',
-                        variable: 'GITHUB_TOKEN'
-                    )
-                ]) {
-
+                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
                     powershell '''
-                        Write-Host "Opening GitHub Pull Request..."
-
                         python scripts/create_ai_pr.py
-
-                        if ($LASTEXITCODE -ne 0) {
-                            exit $LASTEXITCODE
-                        }
-
-                        Write-Host "GitHub Pull Request created successfully."
+                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                     '''
                 }
             }
         }
 
-        // ============================================================
-        // FINALIZE VALIDATION
-        // ============================================================
-
         stage('Finalize Validation Result') {
-
             steps {
-
                 script {
-
                     if (!fileExists('gate-status.txt')) {
-
-                        error(
-                            'Security Gate result file is missing.'
-                        )
+                        error('Remediation result is missing; manual review is required.')
                     }
-
-                    def finalGateStatus =
-                        readFile('gate-status.txt').trim()
-
-                    echo "Final Security Gate result: ${finalGateStatus}"
-
-                    if (finalGateStatus == 'FAIL') {
-
-                        echo 'Validation failed.'
-                        echo 'Dashboard ticket has already been updated.'
-                        echo 'No validated PR was created.'
-
+                    def status = readFile('gate-status.txt').trim()
+                    echo "AI remediation result: ${status}"
+                    if (status != 'PASS') {
                         currentBuild.result = 'FAILURE'
-
-                        error(
-                            'AI remediation validation failed. ' +
-                            'See dashboard ticket and scanner results.'
-                        )
+                        error('AI remediation was not validated. The original file was preserved or restored; review dashboard evidence.')
                     }
-
-                    if (finalGateStatus != 'PASS') {
-
-                        currentBuild.result = 'FAILURE'
-
-                        error(
-                            "Unexpected Security Gate status: ${finalGateStatus}"
-                        )
-                    }
-
-                    echo 'AI remediation validation PASSED.'
-                    echo 'Dashboard ticket has been updated.'
-                    echo 'Validated branch and PR workflow completed.'
+                    echo 'Validated branch and PR are ready for human review. No merge or deployment was performed.'
                 }
             }
         }
     }
 
-    // ================================================================
-    // POST
-    // ================================================================
-
     post {
-
-        always {
-            echo "AI single-fix job finished for ticket #${params.TICKET_ID}"
-        }
-
-        success {
-            echo "AI remediation validation completed successfully."
-        }
-
-        failure {
-            echo "AI remediation validation failed or the remediation workflow encountered an error."
-        }
+        always { echo "AI remediation job finished for ticket #${params.TICKET_ID}" }
+        failure { echo 'Remediation failed validation or requires manual review.' }
     }
 }

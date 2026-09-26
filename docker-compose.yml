@@ -8,8 +8,8 @@ services:
       - dashboard-data:/data
     environment:
       JENKINS_URL: "http://host.docker.internal:8080"
-      JENKINS_USER: "kowshika"
-      JENKINS_API_TOKEN: "116085a31c4ec9c7f373ee0d8addc1b1ef"
+      JENKINS_USER: "${JENKINS_USER:-}"
+      JENKINS_API_TOKEN: "${JENKINS_API_TOKEN:-}"
       JENKINS_FIX_JOB: "ai-single-fix"
       DASHBOARD_DB_PATH: "/data/dashboard.db"
     restart: unless-stopped

@@ -17,16 +17,23 @@ def main():
     branch = os.environ["AI_BRANCH"]
     ticket = os.environ.get("TICKET_ID", "")
     rule = os.environ.get("RULE_ID", "")
-    explanation = os.environ.get("AI_EXPLANATION", "AI-suggested remediation validated by Jenkins.")
+    with open(".ai-fix-result.json", encoding="utf-8") as result_file:
+        result = json.load(result_file)
+    explanation = result.get("analysis", "")
+    remediation = result.get("proposed_remediation", "")
     title = f"Security fix: {rule} (ticket #{ticket})"
     body = f"""## AI-Suggested Security Fix
 
 - Ticket: #{ticket}
 - Rule: `{rule}`
-- Validation: Jenkins security gate passed on this branch
-- Provider: {os.environ.get("AI_PROVIDER", "configured AI provider")}
+- Vulnerability: `{result.get('vulnerability_id', rule)}` ({result.get('severity', 'UNKNOWN')})
+- Validation: tests passed; target finding absent after rescanning; no new findings detected
+- Provider/model: Groq / `{result.get('model', os.environ.get('GROQ_MODEL', 'configured Groq model'))}`
+- Files changed: {', '.join(result.get('files_changed', []))}
 
-{explanation}
+**Analysis:** {explanation}
+
+**Proposed remediation:** {remediation}
 
 **Human review and merge are required. No automatic merge or deployment is performed.**
 """
@@ -40,8 +47,9 @@ def main():
     if callback:
         payload = json.dumps({
             "explanation": explanation,
+            "remediation": remediation,
             "pr_url": url,
-            "provider": os.environ.get("AI_PROVIDER", "")
+            "provider": "Groq",
         }).encode()
         req = urllib.request.Request(
             f"{callback}/api/tickets/{ticket}/mark-pr-opened",

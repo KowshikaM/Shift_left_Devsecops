@@ -23,64 +23,14 @@ GENERIC_HINTS = {
 
 
 def classify_finding(source, rule_id, file_name, message):
-    text = " ".join([str(source or ""), str(rule_id or ""), str(file_name or ""), str(message or "")]).lower()
-
-    if "gitleaks" in text or "secret" in text or "credential" in text or "password" in text or "token" in text or "api key" in text:
-        return {
-            "classification": "MANUAL",
-            "why": "The issue exposes credential material or secret data, which must never be sent to an AI provider.",
-            "plan": [
-                "Revoke or rotate the exposed secret immediately.",
-                "Remove the secret from source control and configuration files.",
-                "Load the value from a secrets manager or environment variable.",
-                "Re-run the scanner and confirm the secret is gone before merge."
-            ],
-        }
-
-    if "kubernetes" in text or "dockerfile" in text or "resource limit" in text or "run as non root" in text or "allow privilege escalation" in text:
-        return {
-            "classification": "AI_ELIGIBLE",
-            "why": "This is a deterministic hardening requirement with a clear, policy-based remediation path.",
-            "plan": [
-                "Update the manifest or Dockerfile to satisfy the policy.",
-                "Add the required security settings such as resource limits or non-root execution.",
-                "Validate the modified file with the security gate and re-run the pipeline.",
-                "Open a human-reviewed PR if the fix passes the checks."
-            ],
-        }
-
-    if "sql injection" in text or "command injection" in text or "xss" in text or "path traversal" in text or "unsafe deserialization" in text:
-        return {
-            "classification": "MANUAL",
-            "why": "This is an application logic issue that affects business behavior and requires developer review, not blind automation.",
-            "plan": [
-                "Identify the unsafe input sink and the user-controlled data flow.",
-                "Replace unsafe concatenation or string-building with parameterized or validated input handling.",
-                "Add or update a regression test covering the vulnerable path.",
-                "Re-run Semgrep and the relevant tests, then submit a human-reviewed fix."
-            ],
-        }
-
-    if source in ("trivy", "semgrep"):
-        return {
-            "classification": "AI_ASSISTED",
-            "why": "This issue may be fixable with a recommended patch, but it still needs human review to confirm behavior and safety.",
-            "plan": [
-                "Review the exact vulnerability and affected file.",
-                "Use the AI suggestion only as a starting point, not as an automatic merge.",
-                "Verify the change with the relevant scanner and tests.",
-                "Approve the PR only after the remediation is validated."
-            ],
-        }
-
     return {
         "classification": "MANUAL",
-        "why": "This issue requires human investigation because it is neither a simple policy fix nor a safe automated patch target.",
+        "why": "This ticket is HIGH/CRITICAL and is never eligible for automatic AI remediation.",
         "plan": [
-            "Inspect the root cause in the relevant file.",
-            "Apply the minimal secure change that addresses the actual issue.",
-            "Validate the fix using the security gate and unit checks.",
-            "Submit the change for human review before merge."
+            "Investigate the finding and affected file manually.",
+            "Rotate any exposed secret immediately and remove it from source control.",
+            "Create a focused fix with appropriate regression coverage.",
+            "Re-run the required scanners and tests, then submit the change for human review."
         ],
     }
 

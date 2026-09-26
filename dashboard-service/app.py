@@ -6,9 +6,8 @@ A small, always-running web service that:
   - Receives scan results from Jenkins after every pipeline run (POST /api/builds)
   - Stores everything permanently in SQLite (build history + findings/tickets)
   - Serves a live dashboard website reading from that database
-  - Lets a developer click "Apply AI Fix" on a ticket, which remotely
-    triggers a focused Jenkins job that uses the configured OpenAI/Groq AI provider to propose a fix just that one
-    finding and open a Pull Request
+    - lets a developer request a constrained Groq proposal for one eligible
+        finding, validated by the existing focused Jenkins job before a PR
 
 Run with:  python3 app.py   (or via the provided Dockerfile / docker-compose)
 Listens on port 5000.
@@ -23,15 +22,15 @@ import urllib.error
 import urllib.parse
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, g
+from remediation_policy import classify_finding
 
 DB_PATH = os.environ.get("DASHBOARD_DB_PATH", "dashboard.db")
 SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
 
-# --- REPLACE THESE with your real Jenkins details for the "Apply AI Fix" button to work ---
-JENKINS_URL = os.environ.get("JENKINS_URL", "http://localhost:8080")          # REPLACE ME
-JENKINS_USER = os.environ.get("JENKINS_USER", "your-jenkins-username")        # REPLACE ME
-JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN", "your-jenkins-token") # REPLACE ME (Jenkins > your user > Security > API Token)
-JENKINS_FIX_JOB = os.environ.get("JENKINS_FIX_JOB", "ai-single-fix")          # the parameterized Jenkins job name (see Jenkinsfile.single-fix)
+JENKINS_URL = os.environ.get("JENKINS_URL", "http://localhost:8080")
+JENKINS_USER = os.environ.get("JENKINS_USER", "")
+JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN", "")
+JENKINS_FIX_JOB = os.environ.get("JENKINS_FIX_JOB", "ai-single-fix")
 
 app = Flask(__name__, static_folder="static")
 
@@ -74,6 +73,19 @@ def init_db():
         "remediation_type": "ALTER TABLE findings ADD COLUMN remediation_type TEXT DEFAULT 'MANUAL'",
         "remediation_reason": "ALTER TABLE findings ADD COLUMN remediation_reason TEXT",
         "remediation_guide": "ALTER TABLE findings ADD COLUMN remediation_guide TEXT",
+        "vulnerability_id": "ALTER TABLE findings ADD COLUMN vulnerability_id TEXT",
+        "package_name": "ALTER TABLE findings ADD COLUMN package_name TEXT",
+        "installed_version": "ALTER TABLE findings ADD COLUMN installed_version TEXT",
+        "affected_line": "ALTER TABLE findings ADD COLUMN affected_line INTEGER",
+        "scanner_recommendation": "ALTER TABLE findings ADD COLUMN scanner_recommendation TEXT",
+        "ai_analysis": "ALTER TABLE findings ADD COLUMN ai_analysis TEXT",
+        "proposed_remediation": "ALTER TABLE findings ADD COLUMN proposed_remediation TEXT",
+        "files_changed": "ALTER TABLE findings ADD COLUMN files_changed TEXT DEFAULT '[]'",
+        "test_status": "ALTER TABLE findings ADD COLUMN test_status TEXT DEFAULT 'NOT_RUN'",
+        "rescan_status": "ALTER TABLE findings ADD COLUMN rescan_status TEXT DEFAULT 'NOT_RUN'",
+        "remediation_status": "ALTER TABLE findings ADD COLUMN remediation_status TEXT DEFAULT 'PENDING'",
+        "before_scan_result": "ALTER TABLE findings ADD COLUMN before_scan_result TEXT",
+        "after_scan_result": "ALTER TABLE findings ADD COLUMN after_scan_result TEXT",
         "before_status": "ALTER TABLE findings ADD COLUMN before_status TEXT DEFAULT 'BLOCKED'",
         "after_status": "ALTER TABLE findings ADD COLUMN after_status TEXT DEFAULT 'PENDING'",
         "validation_summary": "ALTER TABLE findings ADD COLUMN validation_summary TEXT",
@@ -161,17 +173,27 @@ def create_build():
         for finding in findings:
             db.execute(
                 """INSERT INTO findings
-                   (build_id, source, severity, file_path, rule_id, message, fixed_version, status,
-                    remediation_type, remediation_reason, remediation_guide, before_status, after_status,
-                    validation_summary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)""",
+                                     (build_id, source, severity, file_path, rule_id, message, fixed_version, status,
+                                        remediation_type, remediation_reason, remediation_guide, vulnerability_id,
+                                        package_name, installed_version, affected_line, scanner_recommendation,
+                                        ai_analysis, proposed_remediation, files_changed, test_status, rescan_status,
+                                        remediation_status, before_scan_result, after_scan_result, before_status,
+                                        after_status, validation_summary)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (build_id, finding.get("source", ""), finding.get("severity", "LOW"),
                  finding.get("file_path", ""), finding.get("rule_id", ""),
                  finding.get("message", ""), finding.get("fixed_version", "-"),
                  finding.get("remediation_type", "MANUAL"),
                  finding.get("remediation_reason", "Follow the remediation guide for a manual fix."),
                  finding.get("remediation_guide", "Review the issue details and fix it in the affected file."),
-                 finding.get("before_status", "BLOCKED"),
+                                 finding.get("vulnerability_id", finding.get("rule_id", "")),
+                                 finding.get("package_name", ""), finding.get("installed_version", ""),
+                                 finding.get("affected_line"), finding.get("scanner_recommendation", ""),
+                                 finding.get("ai_analysis", ""), finding.get("proposed_remediation", ""),
+                                 finding.get("files_changed", "[]"), finding.get("test_status", "NOT_RUN"),
+                                 finding.get("rescan_status", "NOT_RUN"), finding.get("remediation_status", "PENDING"),
+                                 finding.get("before_scan_result", ""), finding.get("after_scan_result", ""),
+                                 finding.get("before_status", "BLOCKED"),
                  finding.get("after_status", "PENDING"),
                  finding.get("validation_summary", "Before: blocked. After: validation pending.")),
             )
@@ -245,6 +267,8 @@ def audit_log():
 # ---------------------------------------------------------------------------
 def jenkins_crumb():
     """Jenkins CSRF protection requires a crumb token for POST requests."""
+    if not JENKINS_USER or not JENKINS_API_TOKEN:
+        return None, None
     req = urllib.request.Request(f"{JENKINS_URL}/crumbIssuer/api/json")
     auth = base64.b64encode(f"{JENKINS_USER}:{JENKINS_API_TOKEN}".encode()).decode()
     req.add_header("Authorization", f"Basic {auth}")
@@ -259,11 +283,18 @@ def jenkins_crumb():
 
 def trigger_jenkins_fix_job(finding):
     """Remotely triggers the parameterized 'ai-single-fix' Jenkins job."""
+    if not JENKINS_USER or not JENKINS_API_TOKEN:
+        return False, "Configure JENKINS_USER and JENKINS_API_TOKEN in the local .env file."
     params = urllib.parse.urlencode({
         "FILE_PATH": finding["file_path"] or "",
         "RULE_ID": finding["rule_id"] or "",
         "MESSAGE": finding["message"] or "",
         "SOURCE": finding["source"] or "",
+        "SEVERITY": finding["severity"] or "UNKNOWN",
+        "VULNERABILITY_ID": finding["vulnerability_id"] or finding["rule_id"] or "",
+        "PACKAGE_NAME": finding["package_name"] or "",
+        "INSTALLED_VERSION": finding["installed_version"] or "",
+        "FIXED_VERSION": finding["fixed_version"] or "",
         "TICKET_ID": str(finding["id"]),
         "DASHBOARD_CALLBACK_URL": request.host_url.rstrip("/"),
     })
@@ -291,21 +322,21 @@ def apply_ai_fix(finding_id):
     if not finding:
         return jsonify({"error": "not found"}), 404
 
-    remediation_type = str(finding["remediation_type"] or "MANUAL").upper()
-    if remediation_type not in {"AI_ELIGIBLE", "AI_ASSISTED"}:
+    policy = classify_finding(finding["severity"], finding["source"], finding["rule_id"], finding["message"])
+    if not policy["ai_eligible"]:
         log_event(finding["build_id"], finding_id, "ai_fix_blocked_manual",
-                  "AI is blocked because the finding requires manual remediation.")
+                  "AI is blocked by severity/secret policy; manual remediation is required.")
         return jsonify({
             "status": "blocked",
-            "detail": "This finding requires manual remediation. Review the remediation guide before changing the code.",
-            "remediation_type": remediation_type,
-            "remediation_reason": finding["remediation_reason"] or "Manual review required.",
+            "detail": "Only LOW and MEDIUM non-secret findings can use AI. HIGH, CRITICAL, and secret findings require manual review.",
+            "remediation_type": "MANUAL",
+            "remediation_reason": policy["reason"],
         }), 400
 
     ok, error = trigger_jenkins_fix_job(finding)
 
     if ok:
-        db.execute("UPDATE findings SET status = 'ai_fix_requested', updated_at = ? WHERE id = ?",
+        db.execute("UPDATE findings SET status = 'ai_fix_requested', remediation_status = 'IN_PROGRESS', updated_at = ? WHERE id = ?",
                    (datetime.utcnow().isoformat(), finding_id))
         db.commit()
         log_event(finding["build_id"], finding_id, "ai_fix_requested",
@@ -322,7 +353,7 @@ def mark_pr_opened(finding_id):
     payload = request.get_json(force=True)
     db = get_db()
     db.execute(
-        "UPDATE findings SET status = 'ai_fix_pr_opened', ai_explanation = ?, pr_url = ?, updated_at = ? WHERE id = ?",
+        "UPDATE findings SET status = 'ai_fix_pr_opened', remediation_status = 'PR_OPENED', ai_explanation = ?, pr_url = ?, updated_at = ? WHERE id = ?",
         (payload.get("explanation", ""), payload.get("pr_url", ""), datetime.utcnow().isoformat(), finding_id),
     )
     db.commit()
@@ -349,14 +380,19 @@ def update_validation_result(finding_id):
     )
     ttl = payload.get("explanation") or validation_summary
 
+    files_changed = payload.get("files_changed", [])
+    if not isinstance(files_changed, list):
+        files_changed = []
     db.execute(
-        "UPDATE findings SET status = ?, after_status = ?, validation_summary = ?, ai_explanation = ?, updated_at = ? WHERE id = ?",
-        ("ai_fix_validated" if status in {"PASS", "FAIL"} else "ai_fix_pending",
-         status,
-         validation_summary,
-         ttl,
-         datetime.utcnow().isoformat(),
-         finding_id),
+        """UPDATE findings SET status = ?, after_status = ?, validation_summary = ?, ai_explanation = ?,
+           ai_analysis = ?, proposed_remediation = ?, files_changed = ?, test_status = ?, rescan_status = ?,
+           remediation_status = ?, before_scan_result = ?, after_scan_result = ?, updated_at = ? WHERE id = ?""",
+        ("ai_fix_validated" if status == "PASS" else ("manual_review_required" if status == "FAIL" else "ai_fix_pending"),
+         status, validation_summary, ttl, payload.get("analysis", ""),
+         payload.get("proposed_remediation", ""), json.dumps(files_changed),
+         payload.get("test_status", "NOT_RUN"), payload.get("rescan_status", "NOT_RUN"),
+         payload.get("remediation_status", "PENDING"), payload.get("before_scan_result", ""),
+         payload.get("after_scan_result", ""), datetime.utcnow().isoformat(), finding_id),
     )
     db.commit()
 
