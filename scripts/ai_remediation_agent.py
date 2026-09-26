@@ -267,31 +267,17 @@ def validate_patch(patch, target):
         raise RuntimeError("Patch path traversal is not allowed")
 
 
-def run_project_tests(root, ticket_id):
+def run_project_tests(root, image_ref):
     log("Running project tests in the validated Node image")
     mount = docker_volume_path(root)
-    volume_name = f"ai-remediation-test-deps-{ticket_id}-{os.getpid()}"
-    run(["docker", "volume", "create", volume_name], cwd=root)
-    try:
-        shared_mount = [
-            "-v", f"{mount}:/workspace", "--mount",
-            f"type=volume,source={volume_name},target=/workspace/app/node_modules",
-            "-w", "/workspace/app",
-        ]
-        install = run([
-            "docker", "run", "--rm", *shared_mount, "node:18", "npm",
-            "install", "--no-save", "--package-lock=false",
-        ], cwd=root, timeout=600, check=False)
-        if install.returncode != 0:
-            raise RuntimeError("Project test dependencies could not be installed")
-        test = run([
-            "docker", "run", "--rm", *shared_mount, "node:18", "npm", "test",
-        ], cwd=root, timeout=300, check=False)
-        if test.returncode != 0:
-            raise RuntimeError("Project tests failed")
-        return "PASS"
-    finally:
-        run(["docker", "volume", "rm", volume_name], cwd=root, check=False)
+    test = run([
+        "docker", "run", "--rm", "-v", f"{mount}:/workspace",
+        "-e", "NODE_PATH=/app/node_modules", "--entrypoint", "node", image_ref,
+        "--test", "/workspace/app/index.test.js",
+    ], cwd=root, timeout=300, check=False)
+    if test.returncode != 0:
+        raise RuntimeError("Project tests failed")
+    return "PASS"
 
 
 def git_branch(root, ticket_id):
@@ -403,7 +389,7 @@ def remediate(args):
         image_ref = f"{IMAGE_NAME}:ai-{args.ticket_id}-after"
         run(["docker", "build", "--tag", image_ref, "."], cwd=root)
         try:
-            result["test_status"] = run_project_tests(root, args.ticket_id)
+            result["test_status"] = run_project_tests(root, image_ref)
         except Exception:
             result["test_status"] = "FAIL"
             raise

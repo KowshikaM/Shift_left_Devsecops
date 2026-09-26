@@ -2,10 +2,6 @@ const express = require('express');
 function createApp() {
   const app = express();
 
-  // INTENTIONAL DEMO VULNERABILITY #1: hardcoded secret
-  // Gitleaks / secret scanning should catch this and fail the build.
-  const API_KEY = "AKIAABCDEFGHIJKLMNOP"; // fake AWS-style key for demo purposes
-
   app.get('/user', (req, res) => {
     const userId = req.query.id;
 

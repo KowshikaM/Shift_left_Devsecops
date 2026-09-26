@@ -43,28 +43,6 @@ pipeline {
             }
         }
 
-        stage('Test Application') {
-            steps {
-                script {
-                    env.PIPELINE_STAGE = 'Application Tests'
-                    env.PIPELINE_STATUS = 'RUNNING'
-                }
-
-                powershell '''
-                    & docker run --rm `
-                      -v "${env:WORKSPACE}:/workspace" `
-                      --mount "type=volume,target=/workspace/app/node_modules" `
-                      -w /workspace/app `
-                      node:18 `
-                      sh -lc "npm install --no-save --package-lock=false && npm test"
-
-                    if ($LASTEXITCODE -ne 0) {
-                        exit $LASTEXITCODE
-                    }
-                '''
-            }
-        }
-
         stage('SAST - Semgrep') {
             steps {
                 script {
@@ -136,6 +114,28 @@ pipeline {
                 powershell '''
                     & docker build `
                       -t "${env:IMAGE_NAME}:${env:IMAGE_TAG}" .
+
+                    if ($LASTEXITCODE -ne 0) {
+                        exit $LASTEXITCODE
+                    }
+                '''
+            }
+        }
+
+        stage('Test Application') {
+            steps {
+                script {
+                    env.PIPELINE_STAGE = 'Application Tests'
+                    env.PIPELINE_STATUS = 'RUNNING'
+                }
+
+                powershell '''
+                    & docker run --rm `
+                      -v "${env:WORKSPACE}:/workspace" `
+                      -e "NODE_PATH=/app/node_modules" `
+                      --entrypoint node `
+                      "${env:IMAGE_NAME}:${env:IMAGE_TAG}" `
+                      --test /workspace/app/index.test.js
 
                     if ($LASTEXITCODE -ne 0) {
                         exit $LASTEXITCODE

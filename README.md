@@ -181,11 +181,12 @@ Run **Build Now**.
 
 The first build is expected to fail because the demo intentionally contains:
 
-- a fake AWS-style secret for Gitleaks
-- an unsafe SQL concatenation pattern for Semgrep
+- a Semgrep-detectable unsafe response pattern in the sample app
 - an old dependency for Trivy
 - a root/insecure Dockerfile
 - a Kubernetes deployment without the required security context/resources and with a `latest` image
+
+The sample app file is kept free of secrets so its MEDIUM Semgrep finding can be safely tested with the AI remediation workflow. Secret findings remain manual-only and must not share a file with AI-eligible source.
 
 The gate should write:
 
