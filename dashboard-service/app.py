@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, g
-from remediation_policy import classify_finding
+from remediation_policy import classify_finding, normalized_repo_path
 
 DB_PATH = os.environ.get("DASHBOARD_DB_PATH", "dashboard.db")
 SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
@@ -240,7 +240,13 @@ def list_tickets():
         params.append(status_filter)
     query += " ORDER BY findings.id DESC LIMIT 200"
     rows = db.execute(query, params).fetchall()
-    return jsonify([dict(r) for r in rows])
+    tickets = [dict(row) for row in rows]
+    for ticket in tickets:
+        policy = ticket_ai_policy(db, ticket)
+        ticket["ai_eligible"] = policy["ai_eligible"]
+        ticket["ai_block_reason"] = policy["reason"]
+        ticket["ai_action_available"] = policy["ai_eligible"] and bool(JENKINS_USER and JENKINS_API_TOKEN)
+    return jsonify(tickets)
 
 
 @app.route("/api/trends", methods=["GET"])
@@ -265,6 +271,28 @@ def audit_log():
 # ---------------------------------------------------------------------------
 # Ticket actions
 # ---------------------------------------------------------------------------
+def ticket_ai_policy(db, finding):
+    policy = classify_finding(finding["severity"], finding["source"], finding["rule_id"], finding["message"])
+    if not policy["ai_eligible"]:
+        return policy
+
+    target = normalized_repo_path(finding["file_path"] or "").split(":", 1)[0].lower()
+    if target:
+        same_build = db.execute(
+            "SELECT source, file_path FROM findings WHERE build_id = ? AND lower(source) = 'gitleaks'",
+            (finding["build_id"],),
+        ).fetchall()
+        for secret in same_build:
+            secret_path = normalized_repo_path(secret["file_path"]).split(":", 1)[0].lower()
+            if secret_path == target:
+                return {
+                    "classification": "MANUAL",
+                    "ai_eligible": False,
+                    "reason": "This file also has a Gitleaks secret finding. Remove and rotate the secret before any source from this file can be sent to Groq.",
+                }
+    return policy
+
+
 def jenkins_crumb():
     """Jenkins CSRF protection requires a crumb token for POST requests."""
     if not JENKINS_USER or not JENKINS_API_TOKEN:
@@ -322,7 +350,7 @@ def apply_ai_fix(finding_id):
     if not finding:
         return jsonify({"error": "not found"}), 404
 
-    policy = classify_finding(finding["severity"], finding["source"], finding["rule_id"], finding["message"])
+    policy = ticket_ai_policy(db, finding)
     if not policy["ai_eligible"]:
         log_event(finding["build_id"], finding_id, "ai_fix_blocked_manual",
                   "AI is blocked by severity/secret policy; manual remediation is required.")
@@ -332,6 +360,11 @@ def apply_ai_fix(finding_id):
             "remediation_type": "MANUAL",
             "remediation_reason": policy["reason"],
         }), 400
+
+    if not JENKINS_USER or not JENKINS_API_TOKEN:
+        detail = "Jenkins connection is not configured. Set JENKINS_USER and JENKINS_API_TOKEN in the local .env file, then recreate the dashboard container."
+        log_event(finding["build_id"], finding_id, "ai_fix_trigger_failed", detail)
+        return jsonify({"status": "error", "detail": detail}), 503
 
     ok, error = trigger_jenkins_fix_job(finding)
 

@@ -28,7 +28,16 @@ function timeAgo(isoString) {
 
 async function fetchJSON(url, opts) {
   const res = await fetch(url, opts);
-  if (!res.ok) throw new Error("Request failed: " + url);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body.detail || body.error || "";
+    } catch (_) {
+      detail = "";
+    }
+    throw new Error(detail || `Request failed (${res.status}): ${url}`);
+  }
   return res.json();
 }
 
@@ -101,14 +110,23 @@ async function renderTrend() {
 async function applyAiFix(ticketId, btn) {
   btn.disabled = true;
   btn.textContent = "Requesting...";
-  try {
-    const res = await fetchJSON(`/api/tickets/${ticketId}/apply-ai-fix`, { method: "POST" });
-    btn.textContent = "Fix requested";
-  } catch (e) {
-    btn.textContent = "Failed - retry";
-    btn.disabled = false;
+  const actions = btn.closest(".ticket-actions");
+  let feedback = actions.querySelector(".ticket-action-feedback");
+  if (!feedback) {
+    feedback = document.createElement("p");
+    feedback.className = "ticket-action-feedback";
+    feedback.setAttribute("role", "status");
+    actions.append(feedback);
   }
-  renderTickets();
+  feedback.textContent = "";
+  try {
+    await fetchJSON(`/api/tickets/${ticketId}/apply-ai-fix`, { method: "POST" });
+    renderTickets();
+  } catch (e) {
+    btn.textContent = "Retry AI fix";
+    btn.disabled = false;
+    feedback.textContent = e.message;
+  }
 }
 
 function showRemediationGuide(ticketId) {
@@ -238,21 +256,22 @@ async function renderTickets() {
     const bg = SEVERITY_BG[t.severity] || "var(--border)";
     const ticketStatus = String(t.status || "open");
     const containsSecret = String(t.source || "").toLowerCase() === "gitleaks" || /secret|credential|password|api[ _-]?key|token/i.test(`${t.rule_id || ""} ${t.message || ""}`);
-    const severityEligible = ["LOW", "MEDIUM"].includes(String(t.severity || "").toUpperCase()) && !containsSecret;
+    const fallbackEligible = ["LOW", "MEDIUM"].includes(String(t.severity || "").toUpperCase()) && !containsSecret;
+    const severityEligible = typeof t.ai_eligible === "boolean" ? t.ai_eligible : fallbackEligible;
     const requiresManualReview = ticketStatus === "manual_review_required";
     const remediationType = severityEligible && !requiresManualReview ? "AI_ELIGIBLE" : "MANUAL";
-    const canApplyAi = ticketStatus === "open" && severityEligible;
+    const canApplyAi = ticketStatus === "open" && severityEligible && t.ai_action_available !== false;
     const vulnerabilityId = t.vulnerability_id || t.rule_id || "Unknown finding";
     const packageVersion = t.package_name
       ? `${t.package_name}${t.installed_version ? ` ${t.installed_version}` : ""}${t.fixed_version && t.fixed_version !== "-" ? ` -> ${t.fixed_version}` : ""}`
       : "";
     const safePrUrl = /^https:\/\/github\.com\/[^\s]+\/pull\/\d+\/?$/.test(String(t.pr_url || "")) ? t.pr_url : "";
     const prLink = safePrUrl ? `<a href="${escapeHtml(safePrUrl)}" target="_blank" rel="noopener">View PR</a>` : "";
-    const remediationReasonText = requiresManualReview
+    const remediationReasonText = t.ai_block_reason || (requiresManualReview
       ? "The previous AI attempt did not pass validation. Manual remediation and review are required."
       : severityEligible
-        ? "LOW/MEDIUM finding; a constrained Groq proposal can be validated before PR review."
-        : (t.remediation_reason || "HIGH/CRITICAL or secret finding; manual remediation and review are required.");
+        ? (t.ai_action_available === false ? "Jenkins is not configured. Set JENKINS_USER and JENKINS_API_TOKEN in the local .env file, then recreate the dashboard container." : "LOW/MEDIUM finding; a constrained Groq proposal can be validated before PR review.")
+        : (t.remediation_reason || "HIGH/CRITICAL or secret finding; manual remediation and review are required."));
     const remediationReason = `<div class="ticket-meta" style="margin-top: 0.5rem; color: var(--text-muted);">${escapeHtml(remediationReasonText)}</div>`;
     const beforeStatus = t.before_status || "BLOCKED";
     const afterStatus = t.after_status || "PENDING";

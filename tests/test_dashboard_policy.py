@@ -43,11 +43,52 @@ class DashboardEligibilityTests(unittest.TestCase):
 
     def test_medium_non_secret_finding_can_trigger_existing_job(self):
         ticket_id = self.add_ticket("MEDIUM", source="trivy")
-        with patch.object(dashboard_app, "trigger_jenkins_fix_job", return_value=(True, None)) as trigger:
+        with patch.object(dashboard_app, "JENKINS_USER", "test-user"), \
+             patch.object(dashboard_app, "JENKINS_API_TOKEN", "test-token"), \
+             patch.object(dashboard_app, "trigger_jenkins_fix_job", return_value=(True, None)) as trigger:
             response = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["status"], "requested")
         trigger.assert_called_once()
+
+    def test_missing_jenkins_configuration_returns_actionable_error(self):
+        ticket_id = self.add_ticket("MEDIUM", source="trivy")
+        with patch.object(dashboard_app, "JENKINS_USER", ""), \
+             patch.object(dashboard_app, "JENKINS_API_TOKEN", ""), \
+             patch.object(dashboard_app, "trigger_jenkins_fix_job") as trigger:
+            response = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("JENKINS_USER", response.get_json()["detail"])
+        trigger.assert_not_called()
+
+    def test_ticket_list_reports_ai_availability(self):
+        self.add_ticket("MEDIUM", source="trivy")
+        with patch.object(dashboard_app, "JENKINS_USER", ""), patch.object(dashboard_app, "JENKINS_API_TOKEN", ""):
+            ticket = self.client.get("/api/tickets").get_json()[0]
+        self.assertTrue(ticket["ai_eligible"])
+        self.assertFalse(ticket["ai_action_available"])
+        self.assertIn("LOW and MEDIUM", ticket["ai_block_reason"])
+
+    def test_same_file_secret_blocks_ai_for_medium_finding(self):
+        ticket_id = self.add_ticket("MEDIUM", source="semgrep")
+        ticket = self.client.get("/api/tickets").get_json()[0]
+        with dashboard_app.app.app_context():
+            db = dashboard_app.get_db()
+            db.execute(
+                "INSERT INTO findings (build_id, source, severity, file_path, rule_id, message) VALUES (?, ?, ?, ?, ?, ?)",
+                (ticket["build_id"], "gitleaks", "CRITICAL", "/repo/Dockerfile", "secret", "Credential detected"),
+            )
+            db.commit()
+        with patch.object(dashboard_app, "JENKINS_USER", "test-user"), \
+             patch.object(dashboard_app, "JENKINS_API_TOKEN", "test-token"), \
+             patch.object(dashboard_app, "trigger_jenkins_fix_job") as trigger:
+            response = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Gitleaks secret", response.get_json()["remediation_reason"])
+        trigger.assert_not_called()
+        ticket = next(item for item in self.client.get("/api/tickets").get_json() if item["id"] == ticket_id)
+        self.assertFalse(ticket["ai_eligible"])
+        self.assertFalse(ticket["ai_action_available"])
 
     def test_low_secret_finding_is_blocked(self):
         ticket_id = self.add_ticket("LOW", source="gitleaks", message="credential detected")
