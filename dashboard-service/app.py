@@ -110,6 +110,15 @@ def log_event(build_id, finding_id, event, detail=""):
     db.commit()
 
 
+def sqlite_text(value):
+    """Convert scanner metadata to a SQLite-compatible TEXT value."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # Ingestion - Jenkins calls this once per pipeline run
 # ---------------------------------------------------------------------------
@@ -188,7 +197,7 @@ def create_build():
                  finding.get("remediation_guide", "Review the issue details and fix it in the affected file."),
                                  finding.get("vulnerability_id", finding.get("rule_id", "")),
                                  finding.get("package_name", ""), finding.get("installed_version", ""),
-                                 finding.get("affected_line"), finding.get("scanner_recommendation", ""),
+                                 finding.get("affected_line"), sqlite_text(finding.get("scanner_recommendation", "")),
                                  finding.get("ai_analysis", ""), finding.get("proposed_remediation", ""),
                                  finding.get("files_changed", "[]"), finding.get("test_status", "NOT_RUN"),
                                  finding.get("rescan_status", "NOT_RUN"), finding.get("remediation_status", "PENDING"),

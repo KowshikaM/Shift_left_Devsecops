@@ -17,25 +17,19 @@ spec:
     spec:
       containers:
         - name: demo-app
-          # REPLACE with your registry path once you push the built image,
-          # e.g. kowshika8/secure-devops-demo:BUILD_TAG
-          image: secure-devops-demo:latest
+          # Jenkins replaces this versioned placeholder with the build-specific image.
+          image: kowshika8/secure-devops-demo:1.0.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3000
-          # NOTE: no resources block and no securityContext on purpose -
-          # policy/k8s_security.rego flags both so you can see the gate work.
-          # Hardened version:
-          #
-          # securityContext:
-          #   runAsNonRoot: true
-          #   runAsUser: 1000
-          #   allowPrivilegeEscalation: false
-          #   readOnlyRootFilesystem: true
-          # resources:
-          #   requests:
-          #     cpu: "100m"
-          #     memory: "128Mi"
-          #   limits:
-          #     cpu: "250m"
-          #     memory: "256Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

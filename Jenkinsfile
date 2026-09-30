@@ -162,6 +162,7 @@ pipeline {
                     }
 
                     & docker run --rm `
+                      --user 0:0 `
                       -v "${env:WORKSPACE}:/out" `
                       aquasec/trivy:latest `
                       image `

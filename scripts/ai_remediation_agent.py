@@ -104,7 +104,7 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
         log(f"Running Trivy image scan ({phase})")
         run(["docker", "save", image_ref, "-o", str(image_tar)], cwd=root)
         trivy_run = run([
-            "docker", "run", "--rm", "-v", f"{report_mount}:/out", "aquasec/trivy:latest",
+            "docker", "run", "--rm", "--user", "0:0", "-v", f"{report_mount}:/out", "aquasec/trivy:latest",
             "image", "--input", "/out/image.tar", "--format", "json",
             "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--timeout", "10m",
             "--output", "/out/trivy-results.json",
