@@ -62,7 +62,17 @@ def check_results():
             continue
 
         if source == "trivy":
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("SchemaVersion"), int)
+                or data.get("SchemaVersion") < 1
+                or not isinstance(data.get("Results"), list)
+            ):
+                missing.append("trivy: missing or invalid Trivy report schema (trivy-results.json)")
+                continue
             for result in data.get("Results", []):
+                if not isinstance(result, dict):
+                    continue
                 for vuln in result.get("Vulnerabilities", []) or []:
                     sev = str(vuln.get("Severity", "UNKNOWN")).upper()
                     if sev in FAIL_SEVERITIES:

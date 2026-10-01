@@ -152,16 +152,18 @@ pipeline {
                 }
 
                 powershell '''
+                    Remove-Item "trivy-results.json" -Force -ErrorAction SilentlyContinue
+
                     & docker save `
                       "${env:IMAGE_NAME}:${env:IMAGE_TAG}" `
                       -o "${env:WORKSPACE}\\trivy-image.tar"
 
                     if ($LASTEXITCODE -ne 0) {
-                        Set-Content "$env:SCAN_DIR\\trivy.status" 1
+                        Set-Content "$env:SCAN_DIR\\trivy.status" 2
                         exit 0
                     }
 
-                    & docker run --rm `
+                    $trivyOutput = & docker run --rm `
                       --user 0:0 `
                       -v "${env:WORKSPACE}:/out" `
                       aquasec/trivy:latest `
@@ -169,16 +171,32 @@ pipeline {
                       --input /out/trivy-image.tar `
                       --format json `
                       --severity CRITICAL,HIGH,MEDIUM,LOW `
-                      --timeout 10m `
-                      --output /out/trivy-results.json
+                      --timeout 10m
 
                     $code = $LASTEXITCODE
+                    $trivyStatus = 2
 
-                    Set-Content "$env:SCAN_DIR\\trivy.status" $code
+                    if ($code -eq 0 -and $trivyOutput) {
+                        try {
+                            $trivyJson = $trivyOutput -join [Environment]::NewLine
+                            $trivyReport = ConvertFrom-Json -InputObject $trivyJson -ErrorAction Stop
+                            $resultsProperty = $trivyReport.PSObject.Properties['Results']
 
-                    if (!(Test-Path "trivy-results.json")) {
-                        '{}' | Set-Content trivy-results.json
+                            if ($trivyReport.SchemaVersion -ge 1 -and $resultsProperty -and $resultsProperty.Value -is [System.Array]) {
+                                [System.IO.File]::WriteAllText(
+                                    "trivy-results.json",
+                                    $trivyJson,
+                                    [System.Text.UTF8Encoding]::new($false)
+                                )
+                                $trivyStatus = 0
+                            }
+                        }
+                        catch {
+                            Write-Host "Trivy did not produce a valid JSON report: $($_.Exception.Message)"
+                        }
                     }
+
+                    Set-Content "$env:SCAN_DIR\\trivy.status" $trivyStatus
 
                     Remove-Item "trivy-image.tar" -Force -ErrorAction SilentlyContinue
 
