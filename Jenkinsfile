@@ -154,6 +154,8 @@ pipeline {
                 powershell '''
                     Remove-Item "trivy-results.json" -Force -ErrorAction SilentlyContinue
 
+                    & docker volume create trivy-cache
+
                     & docker save `
                       "${env:IMAGE_NAME}:${env:IMAGE_TAG}" `
                       -o "${env:WORKSPACE}\\trivy-image.tar"
@@ -165,13 +167,14 @@ pipeline {
 
                     $trivyOutput = & docker run --rm `
                       --user 0:0 `
+                      -v "trivy-cache:/root/.cache/trivy" `
                       -v "${env:WORKSPACE}:/out" `
                       aquasec/trivy:latest `
                       image `
                       --input /out/trivy-image.tar `
                       --format json `
                       --severity CRITICAL,HIGH,MEDIUM,LOW `
-                      --timeout 10m
+                      --timeout 30m
 
                     $code = $LASTEXITCODE
                     $trivyStatus = 2
