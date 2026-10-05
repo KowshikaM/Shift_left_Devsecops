@@ -392,31 +392,47 @@ pipeline {
                     )
                 ]) {
                     powershell '''
-                        $env:DOCKER_PASS | docker login `
-                          -u $env:DOCKER_USER `
-                          --password-stdin
-
-                        if ($LASTEXITCODE -ne 0) {
-                            exit $LASTEXITCODE
+                        if ([string]::IsNullOrWhiteSpace($env:DOCKER_USER) -or [string]::IsNullOrEmpty($env:DOCKER_PASS)) {
+                            throw "Docker Hub credentials were not bound by Jenkins."
                         }
 
-                        $registryImage = "$env:DOCKERHUB_NAMESPACE/$env:IMAGE_NAME:$env:IMAGE_TAG"
+                        $previousDockerConfig = $env:DOCKER_CONFIG
+                        $authDirectory = Join-Path $env:TEMP ("docker-auth-" + [guid]::NewGuid().ToString("N"))
 
-                        docker tag `
-                          "$env:IMAGE_NAME:$env:IMAGE_TAG" `
-                          "$registryImage"
+                        try {
+                            New-Item -ItemType Directory -Path $authDirectory -Force | Out-Null
 
-                        if ($LASTEXITCODE -ne 0) {
-                            exit $LASTEXITCODE
+                            $authValue = [Convert]::ToBase64String(
+                                [Text.Encoding]::UTF8.GetBytes("$($env:DOCKER_USER):$($env:DOCKER_PASS)")
+                            )
+                            $dockerConfig = @{
+                                auths = @{
+                                    "https://index.docker.io/v1/" = @{ auth = $authValue }
+                                }
+                            } | ConvertTo-Json -Compress -Depth 4
+                            [IO.File]::WriteAllText(
+                                (Join-Path $authDirectory "config.json"),
+                                $dockerConfig,
+                                [Text.UTF8Encoding]::new($false)
+                            )
+
+                            $env:DOCKER_CONFIG = $authDirectory
+                            $registryImage = "$env:DOCKERHUB_NAMESPACE/$env:IMAGE_NAME:$env:IMAGE_TAG"
+
+                            docker tag "$env:IMAGE_NAME:$env:IMAGE_TAG" "$registryImage"
+                            if ($LASTEXITCODE -ne 0) { throw "docker tag failed with exit code $LASTEXITCODE" }
+
+                            docker push "$registryImage"
+                            if ($LASTEXITCODE -ne 0) { throw "docker push failed with exit code $LASTEXITCODE" }
                         }
-
-                        docker push "$registryImage"
-
-                        if ($LASTEXITCODE -ne 0) {
-                            exit $LASTEXITCODE
+                        finally {
+                            if ($null -eq $previousDockerConfig) {
+                                Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
+                            } else {
+                                $env:DOCKER_CONFIG = $previousDockerConfig
+                            }
+                            Remove-Item $authDirectory -Recurse -Force -ErrorAction SilentlyContinue
                         }
-
-                        docker logout
                     '''
                 }
             }
