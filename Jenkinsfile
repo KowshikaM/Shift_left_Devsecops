@@ -417,9 +417,9 @@ pipeline {
                             )
 
                             $env:DOCKER_CONFIG = $authDirectory
-                            $registryImage = "$env:DOCKERHUB_NAMESPACE/$env:IMAGE_NAME:$env:IMAGE_TAG"
+                            $registryImage = "${env:DOCKERHUB_NAMESPACE}/${env:IMAGE_NAME}:${env:IMAGE_TAG}"
 
-                            docker tag "$env:IMAGE_NAME:$env:IMAGE_TAG" "$registryImage"
+                            docker tag "${env:IMAGE_NAME}:${env:IMAGE_TAG}" "$registryImage"
                             if ($LASTEXITCODE -ne 0) { throw "docker tag failed with exit code $LASTEXITCODE" }
 
                             docker push "$registryImage"
@@ -473,7 +473,7 @@ pipeline {
                         exit $LASTEXITCODE
                     }
 
-                    $registryImage = "$env:DOCKERHUB_NAMESPACE/$env:IMAGE_NAME:$env:IMAGE_TAG"
+                    $registryImage = "${env:DOCKERHUB_NAMESPACE}/${env:IMAGE_NAME}:${env:IMAGE_TAG}"
 
                     kubectl -n devsecops-demo set image deployment/demo-app `
                       "demo-app=$registryImage"
