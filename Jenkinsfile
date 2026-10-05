@@ -454,7 +454,13 @@ pipeline {
                     env.PIPELINE_STATUS = 'RUNNING'
                 }
 
-                powershell '''
+                withCredentials([
+                    file(
+                        credentialsId: 'kubeconfig-cred',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    powershell '''
                     kubectl config use-context $env:KUBE_CONTEXT
 
                     if ($LASTEXITCODE -ne 0) {
@@ -489,7 +495,8 @@ pipeline {
                     if ($LASTEXITCODE -ne 0) {
                         exit $LASTEXITCODE
                     }
-                '''
+                    '''
+                }
 
                 script {
                     env.DEPLOYED = '1'
