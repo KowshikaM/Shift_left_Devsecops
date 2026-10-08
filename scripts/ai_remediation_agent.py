@@ -109,18 +109,21 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
             "--report-format", "json", "--report-path", "-",
         ])
 
-        image_tar = reports / "image.tar"
+        image_tar = root / f".ai-remediation-{phase}-{ticket_id}-image.tar"
         log(f"Running Trivy image scan ({phase})")
-        run(["docker", "save", image_ref, "-o", str(image_tar)], cwd=root)
-        trivy_args = [
-            "docker", "run", "--rm", "--user", "0:0", "-v", f"{mount}:/src",
-            "-v", "ai-remediation-trivy-cache:/root/.cache/trivy", "aquasec/trivy:latest",
-            "image", "--input", f"{container_reports}/image.tar", "--format", "json", "--quiet",
-            "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--timeout", "30m",
-        ]
-        if phase == "after":
-            trivy_args.append("--skip-db-update")
-        trivy_run = run(trivy_args, cwd=root, timeout=2100, check=False, print_output=False)
+        try:
+            run(["docker", "save", image_ref, "-o", str(image_tar)], cwd=root)
+            trivy_args = [
+                "docker", "run", "--rm", "--user", "0:0", "-v", f"{mount}:/src",
+                "-v", "ai-remediation-trivy-cache:/root/.cache/trivy", "aquasec/trivy:latest",
+                "image", "--input", f"/src/{image_tar.name}", "--format", "json", "--quiet",
+                "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--timeout", "30m",
+            ]
+            if phase == "after":
+                trivy_args.append("--skip-db-update")
+            trivy_run = run(trivy_args, cwd=root, timeout=2100, check=False, print_output=False)
+        finally:
+            image_tar.unlink(missing_ok=True)
         if trivy_run.returncode >= 2:
             raise RuntimeError(f"Trivy scanner execution failed (exit {trivy_run.returncode})")
         try:
