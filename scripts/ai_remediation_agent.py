@@ -86,30 +86,30 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
     # Jenkins may run as SYSTEM and Docker Desktop cannot access C:\Windows\Temp.
     with tempfile.TemporaryDirectory(prefix="ai-remediation-scan-", dir=phase_dir) as temporary:
         reports = Path(temporary)
-        report_mount = docker_volume_path(reports)
+        container_reports = f"/src/{reports.relative_to(root).as_posix()}"
 
         log(f"Running full Semgrep scan ({phase})")
         semgrep = docker_json_scan(root, reports, "semgrep", [
-            "docker", "run", "--rm", "-v", f"{mount}:/src", "-v", f"{report_mount}:/reports",
+            "docker", "run", "--rm", "-v", f"{mount}:/src",
             "returntocorp/semgrep", "semgrep", "scan", "--config", "p/owasp-top-ten",
-            "--config", "p/javascript", "--json", "--output", "/reports/semgrep-results.json", "/src/app",
+            "--config", "p/javascript", "--json", "--output", f"{container_reports}/semgrep-results.json", "/src/app",
         ])
 
         log(f"Running full Gitleaks scan ({phase})")
         gitleaks = docker_json_scan(root, reports, "gitleaks", [
-            "docker", "run", "--rm", "-v", f"{mount}:/repo", "-v", f"{report_mount}:/reports",
-            "zricethezav/gitleaks:latest", "detect", "--source", "/repo", "--no-git",
-            "--report-format", "json", "--report-path", "/reports/gitleaks-results.json",
+            "docker", "run", "--rm", "-v", f"{mount}:/src",
+            "zricethezav/gitleaks:latest", "detect", "--source", "/src", "--no-git",
+            "--report-format", "json", "--report-path", f"{container_reports}/gitleaks-results.json",
         ])
 
         image_tar = reports / "image.tar"
         log(f"Running Trivy image scan ({phase})")
         run(["docker", "save", image_ref, "-o", str(image_tar)], cwd=root)
         trivy_run = run([
-            "docker", "run", "--rm", "--user", "0:0", "-v", f"{report_mount}:/out", "aquasec/trivy:latest",
-            "image", "--input", "/out/image.tar", "--format", "json",
+            "docker", "run", "--rm", "--user", "0:0", "-v", f"{mount}:/src", "aquasec/trivy:latest",
+            "image", "--input", f"{container_reports}/image.tar", "--format", "json",
             "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--timeout", "10m",
-            "--output", "/out/trivy-results.json",
+            "--output", f"{container_reports}/trivy-results.json",
         ], cwd=root, timeout=900, check=False)
         if trivy_run.returncode >= 2:
             raise RuntimeError(f"Trivy scanner execution failed (exit {trivy_run.returncode})")
