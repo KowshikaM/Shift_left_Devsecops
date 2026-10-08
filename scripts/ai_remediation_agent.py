@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -27,10 +28,12 @@ def run(command, *, cwd, timeout=900, input_text=None, check=True):
     result = subprocess.run(
         command, cwd=str(cwd), input=input_text, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-        shell=False, check=False,
+        encoding="utf-8", errors="replace", shell=False, check=False,
     )
     if result.stdout:
-        print(result.stdout.rstrip(), flush=True)
+        encoding = sys.stdout.encoding or "utf-8"
+        printable = result.stdout.encode(encoding, errors="replace").decode(encoding)
+        print(printable.rstrip(), flush=True)
     if check and result.returncode != 0:
         raise RuntimeError(f"Approved command failed (exit {result.returncode}): {Path(command[0]).name}")
     return result
