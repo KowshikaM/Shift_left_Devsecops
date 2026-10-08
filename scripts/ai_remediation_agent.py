@@ -269,6 +269,8 @@ def validate_proposal(proposal, finding, target):
 
 
 def validate_patch(patch, target):
+    if not isinstance(patch, str) or not patch.strip():
+        raise RuntimeError("Proposed patch must be non-empty text")
     if len(patch.splitlines()) > 500:
         raise RuntimeError("Proposed patch exceeds the 500-line safety limit")
     changed_paths = []
@@ -282,7 +284,8 @@ def validate_patch(patch, target):
         raise RuntimeError("Patch must modify exactly the reported file")
     if any(part == ".." for part in target.replace("\\", "/").split("/")):
         raise RuntimeError("Patch path traversal is not allowed")
-    if not any(line.startswith("@@ ") for line in patch.splitlines()):
+    hunk_header = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: .*)?$")
+    if not any(hunk_header.match(line) for line in patch.splitlines()):
         raise RuntimeError("Patch must contain at least one unified-diff hunk")
 
 
