@@ -95,14 +95,14 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
         semgrep = docker_json_scan(root, reports, "semgrep", [
             "docker", "run", "--rm", "-v", f"{mount}:/src",
             "returntocorp/semgrep", "semgrep", "scan", "--config", "p/owasp-top-ten",
-            "--config", "p/javascript", "--json", "--output", f"{container_reports}/semgrep-results.json", "/src/app",
+            "--config", "p/javascript", "--quiet", "--json", "/src/app",
         ])
 
         log(f"Running full Gitleaks scan ({phase})")
         gitleaks = docker_json_scan(root, reports, "gitleaks", [
             "docker", "run", "--rm", "-v", f"{mount}:/src",
             "zricethezav/gitleaks:latest", "detect", "--source", "/src", "--no-git",
-            "--report-format", "json", "--report-path", f"{container_reports}/gitleaks-results.json",
+            "--report-format", "json", "--report-path", "-",
         ])
 
         image_tar = reports / "image.tar"
@@ -110,15 +110,14 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
         run(["docker", "save", image_ref, "-o", str(image_tar)], cwd=root)
         trivy_run = run([
             "docker", "run", "--rm", "--user", "0:0", "-v", f"{mount}:/src", "aquasec/trivy:latest",
-            "image", "--input", f"{container_reports}/image.tar", "--format", "json",
+            "image", "--input", f"{container_reports}/image.tar", "--format", "json", "--quiet",
             "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--timeout", "10m",
-            "--output", f"{container_reports}/trivy-results.json",
         ], cwd=root, timeout=900, check=False)
         if trivy_run.returncode >= 2:
             raise RuntimeError(f"Trivy scanner execution failed (exit {trivy_run.returncode})")
         try:
-            trivy = json.loads((reports / "trivy-results.json").read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as error:
+            trivy = json.loads(trivy_run.stdout or "")
+        except json.JSONDecodeError as error:
             raise RuntimeError("Trivy returned missing or invalid JSON") from error
 
         log(f"Running Dockerfile and Kubernetes policy scans ({phase})")
