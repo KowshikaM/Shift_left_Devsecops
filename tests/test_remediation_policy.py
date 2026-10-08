@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "dashboard-service"))
 
 from remediation_policy import classify_finding, load_scanner_findings, semgrep_severity
-from ai_remediation_agent import commit_one_file, compare_scan_results, request_valid_patch, validate_patch, validate_proposal
+from ai_remediation_agent import commit_one_file, compare_scan_results, normalize_patch_format, request_valid_patch, validate_patch, validate_proposal
 
 
 class RemediationPolicyTests(unittest.TestCase):
@@ -69,12 +69,23 @@ class RemediationPolicyTests(unittest.TestCase):
     def test_patch_must_change_only_expected_file(self):
         valid = "--- a/app/index.js\n+++ b/app/index.js\n@@ -1 +1 @@\n-old\n+new\n"
         validate_patch(valid, "app/index.js")
+        fenced = "```diff\n" + valid.rstrip("\n") + "\n```"
+        normalized = normalize_patch_format(fenced)
+        self.assertEqual(normalized, valid.rstrip("\n"))
+        validate_patch(normalized, "app/index.js")
         for invalid in ("", "   ", "--- a/app/index.js\n+++ b/app/index.js\n", "--- a/app/index.js\n+++ b/app/index.js\n@@ malformed @@\n-old\n+new\n"):
             with self.subTest(patch=invalid), self.assertRaises(RuntimeError):
                 validate_patch(invalid, "app/index.js")
-        invalid = "--- a/app/index.js\n+++ b/app/index.js\n--- a/README.md\n+++ b/README.md\n"
+        invalid = (
+            "--- a/app/index.js\n+++ b/app/index.js\n@@ -1 +1 @@\n-old\n+new\n"
+            "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n"
+        )
         with self.assertRaises(RuntimeError):
             validate_patch(invalid, "app/index.js")
+        self.assertEqual(normalize_patch_format("```python\n" + valid + "\n```"), "```python\n" + valid + "\n```")
+        traversal = "--- a/app/index.js\n+++ b/app/../README.md\n@@ -1 +1 @@\n-old\n+new\n"
+        with self.assertRaises(RuntimeError):
+            validate_patch(traversal, "app/index.js")
 
     def test_unapplicable_patch_is_rejected_before_working_tree_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -95,6 +106,8 @@ class RemediationPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "corrected patch still does not apply"):
                     request_valid_patch(prompt, finding, "app/index.js", root)
             self.assertEqual(request.call_count, 2)
+            retry_prompt = json.loads(request.call_args_list[1].args[0])
+            self.assertIn("patch_validation_feedback", retry_prompt)
             self.assertEqual(target_file.read_bytes(), original)
 
     def test_proposal_cannot_change_severity_or_target(self):

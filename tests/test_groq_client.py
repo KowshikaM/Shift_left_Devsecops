@@ -17,14 +17,19 @@ class GroqClientTests(unittest.TestCase):
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         response.read.return_value = json.dumps({"choices": [{"message": {"content": json.dumps(proposal)}}]}).encode()
+        retry_prompt = json.dumps({"patch_validation_feedback": "Previous diff had no valid hunk; return a numeric unified-diff hunk."})
         with patch("groq_client.urllib.request.urlopen", return_value=response) as request:
             with patch.dict(os.environ, {"GROQ_MODEL": "test-model"}):
-                result, model = request_remediation("safe prompt", api_key="test-secret")
+                result, model = request_remediation(retry_prompt, api_key="test-secret")
         self.assertEqual(result, proposal)
         self.assertEqual(model, "test-model")
         sent_request = request.call_args.args[0]
         self.assertEqual(sent_request.full_url, "https://api.groq.com/openai/v1/chat/completions")
         self.assertNotIn("test-secret", sent_request.data.decode())
+        sent_body = json.loads(sent_request.data.decode())
+        self.assertEqual(sent_body["response_format"], {"type": "json_object"})
+        self.assertEqual(sent_body["messages"][1]["content"], retry_prompt)
+        self.assertIn("numeric @@", sent_body["messages"][0]["content"])
 
     def test_rate_limit_is_reported_without_exposing_key(self):
         response = Mock()

@@ -223,6 +223,10 @@ def make_prompt(finding, path, source_text, root):
         "task": "Propose one minimal security remediation using a unified diff for exactly the affected file.",
         "constraints": [
             "The diff must modify only the supplied affected file and must apply with git apply.",
+            f"The patch field must contain only a unified diff for {path}: its first two lines must be '--- a/{path}' and '+++ b/{path}'.",
+            "Include at least one real hunk header in the form @@ -<numeric-start>[,<numeric-count>] +<numeric-start>[,<numeric-count>] @@; calculate valid ranges from the supplied file.",
+            "Use unified-diff body lines only: context starts with one space, removals with -, additions with +. Include a real change.",
+            "Do not put Markdown fences, a language label, apply_patch markers, or explanations inside the patch string.",
             "Do not output shell commands, scripts to execute, credentials, URLs, or new dependencies.",
             "Do not change unrelated behavior. The Python controller, not you, runs all tests and scanners.",
             "Return the required structured JSON fields; use a unified diff in patch.",
@@ -239,7 +243,7 @@ def make_prompt(finding, path, source_text, root):
         "required_json": {
             "vulnerability_id": "same as input", "severity": "same as input",
             "affected_file": "same as input", "analysis": "cause and impact",
-            "remediation": "concise proposed fix", "patch": "unified diff, one file only",
+            "remediation": "concise proposed fix", "patch": f"only the raw unified diff for {path}, with ---/+++ file headers and at least one numeric @@ hunk header",
             "confidence": "HIGH, MEDIUM, or LOW", "tests_required": True,
             "reason": "why this is the minimal safe change",
         },
@@ -289,6 +293,14 @@ def validate_patch(patch, target):
         raise RuntimeError("Patch must contain at least one unified-diff hunk")
 
 
+def normalize_patch_format(patch):
+    """Remove only a single outer Markdown diff fence; leave diff bytes intact."""
+    if not isinstance(patch, str):
+        return patch
+    match = re.fullmatch(r"[ \t]*```(?:diff)?[ \t]*\r?\n(.*?)\r?\n```[ \t]*", patch, re.IGNORECASE | re.DOTALL)
+    return match.group(1) if match else patch
+
+
 def request_valid_patch(prompt, finding, target, root):
     feedback = None
     for attempt in range(2):
@@ -303,6 +315,7 @@ def request_valid_patch(prompt, finding, target, root):
             request_prompt = json.dumps(request_data, ensure_ascii=False)
         proposal, model = request_remediation(request_prompt)
         patch = validate_proposal(proposal, finding, target)
+        patch = normalize_patch_format(patch)
         try:
             validate_patch(patch, target)
         except RuntimeError as exc:

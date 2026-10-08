@@ -26,7 +26,7 @@ def request_remediation(prompt, api_key=None):
     request_body = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "Return one JSON object only. Propose a minimal unified diff for the supplied single file. Never request or execute commands."},
+            {"role": "system", "content": "Return exactly one JSON object. Its patch string must contain only a real unified diff for the supplied single file, with --- a/<path> and +++ b/<path> headers and at least one numeric @@ -start[,count] +start[,count] @@ hunk containing context/removal/addition lines. Do not put Markdown fences, apply_patch markers, or explanations in the patch. Never request or execute commands."},
             {"role": "user", "content": prompt},
         ],
         "response_format": {"type": "json_object"},
