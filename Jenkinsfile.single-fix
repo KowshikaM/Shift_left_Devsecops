@@ -39,17 +39,37 @@ pipeline {
                 withCredentials([string(credentialsId: 'groq-api-key', variable: 'GROQ_API_KEY')]) {
                     withEnv(["GROQ_MODEL=${params.GROQ_MODEL}"]) {
                         powershell '''
-                        python scripts/ai_remediation_agent.py `
-                          --file "$env:FILE_PATH" `
-                          --rule "$env:RULE_ID" `
-                          --message "$env:MESSAGE" `
-                          --source "$env:SOURCE" `
-                          --severity "$env:SEVERITY" `
-                          --vulnerability-id "$env:VULNERABILITY_ID" `
-                          --package-name "$env:PACKAGE_NAME" `
-                          --installed-version "$env:INSTALLED_VERSION" `
-                          --fixed-version "$env:FIXED_VERSION" `
-                          --ticket-id "$env:TICKET_ID"
+                        foreach ($name in @('FILE_PATH', 'RULE_ID', 'TICKET_ID', 'SOURCE', 'SEVERITY')) {
+                            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+                                throw "Required AI remediation parameter is empty: $name"
+                            }
+                        }
+
+                        $agentArgs = @(
+                            '--file', $env:FILE_PATH,
+                            '--rule', $env:RULE_ID,
+                            '--ticket-id', $env:TICKET_ID,
+                            '--source', $env:SOURCE,
+                            '--severity', $env:SEVERITY
+                        )
+
+                        if (![string]::IsNullOrWhiteSpace($env:MESSAGE)) {
+                            $agentArgs += @('--message', $env:MESSAGE)
+                        }
+                        if (![string]::IsNullOrWhiteSpace($env:VULNERABILITY_ID)) {
+                            $agentArgs += @('--vulnerability-id', $env:VULNERABILITY_ID)
+                        }
+                        if (![string]::IsNullOrWhiteSpace($env:PACKAGE_NAME)) {
+                            $agentArgs += @('--package-name', $env:PACKAGE_NAME)
+                        }
+                        if (![string]::IsNullOrWhiteSpace($env:INSTALLED_VERSION)) {
+                            $agentArgs += @('--installed-version', $env:INSTALLED_VERSION)
+                        }
+                        if (![string]::IsNullOrWhiteSpace($env:FIXED_VERSION)) {
+                            $agentArgs += @('--fixed-version', $env:FIXED_VERSION)
+                        }
+
+                        & python scripts/ai_remediation_agent.py @agentArgs
 
                         if ($LASTEXITCODE -ne 0) {
                             exit $LASTEXITCODE
