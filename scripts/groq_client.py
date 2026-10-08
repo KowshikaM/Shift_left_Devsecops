@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +16,24 @@ MAX_RATE_LIMIT_RETRY_SECONDS = 60
 
 class GroqRequestError(RuntimeError):
     """A safe, key-free description of a failed Groq request or response."""
+
+
+def safe_http_error_detail(error, api_key):
+    try:
+        body = error.read(4096).decode("utf-8", errors="replace")
+        payload = json.loads(body)
+        detail = payload.get("error", payload) if isinstance(payload, dict) else payload
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("code") or detail
+        detail = str(detail)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return ""
+    if api_key:
+        detail = detail.replace(api_key, "[REDACTED]")
+    detail = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", detail)
+    detail = re.sub(r"\b(?:gsk|sk|ghp|github_pat)_[A-Za-z0-9_-]{8,}\b", "[REDACTED]", detail)
+    detail = "".join(char for char in detail if char.isprintable()).strip()
+    return detail[:500]
 
 
 def request_remediation(prompt, api_key=None):
@@ -71,6 +90,9 @@ def request_remediation(prompt, api_key=None):
                 detail = "authentication or access denied"
             else:
                 detail = f"HTTP {error.code}"
+            provider_detail = safe_http_error_detail(error, api_key)
+            if provider_detail:
+                detail = f"{detail}: {provider_detail}"
             raise GroqRequestError(f"Groq request failed ({detail})") from error
         except urllib.error.URLError as error:
             raise GroqRequestError(f"Groq network error: {error.reason}") from error

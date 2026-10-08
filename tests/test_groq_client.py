@@ -55,6 +55,17 @@ class GroqClientTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(0.0)
 
+    def test_http_error_detail_is_useful_and_redacts_credentials(self):
+        response = Mock()
+        response.read.return_value = json.dumps({
+            "error": {"message": "invalid retry payload; Authorization: Bearer secret-value"}
+        }).encode()
+        error = urllib.error.HTTPError("https://api.groq.com", 400, "bad request", {}, response)
+        with patch("groq_client.urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(GroqRequestError, "HTTP 400: invalid retry payload") as raised:
+                request_remediation("prompt", api_key="secret-value")
+        self.assertNotIn("secret-value", str(raised.exception))
+
     def test_missing_key_and_malformed_response_fail_closed(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(GroqRequestError, "GROQ_API_KEY"):

@@ -112,6 +112,30 @@ class RemediationPolicyTests(unittest.TestCase):
             self.assertIn("Diagnostic:", feedback)
             self.assertEqual(target_file.read_bytes(), original)
 
+    def test_missing_hunk_retry_can_return_a_preflight_checked_patch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target_file = root / "app" / "index.js"
+            target_file.parent.mkdir()
+            target_file.write_text("old\n", encoding="utf-8")
+            proposal = {
+                "vulnerability_id": "RULE-1", "severity": "MEDIUM", "affected_file": "app/index.js",
+                "analysis": "cause", "remediation": "fix", "patch": "--- a/app/index.js\n+++ b/app/index.js\n",
+                "confidence": "HIGH", "tests_required": True, "reason": "minimal",
+            }
+            corrected = {**proposal, "patch": "--- a/app/index.js\n+++ b/app/index.js\n@@ -1 +1 @@\n-old\n+new\n"}
+            finding = {"vulnerability_id": "RULE-1", "severity": "MEDIUM"}
+            prompt = json.dumps({"constraints": []})
+            with mock_patch(
+                "ai_remediation_agent.request_remediation",
+                side_effect=[(proposal, "test-model"), (corrected, "test-model")],
+            ) as request:
+                _, _, accepted_patch = request_valid_patch(prompt, finding, "app/index.js", root)
+            retry_prompt = json.loads(request.call_args_list[1].args[0])
+            self.assertIn("patch_validation_feedback", retry_prompt)
+            self.assertEqual(accepted_patch, corrected["patch"])
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "old\n")
+
     def test_proposal_cannot_change_severity_or_target(self):
         finding = {"vulnerability_id": "CVE-1", "severity": "LOW"}
         proposal = {
