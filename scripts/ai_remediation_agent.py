@@ -82,7 +82,9 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
         log(f"Building isolated validation image for {phase}")
         run(["docker", "build", "--tag", image_ref, "."], cwd=root)
 
-    with tempfile.TemporaryDirectory(prefix="ai-remediation-scan-") as temporary:
+    # Keep bind-mounted scan reports under the Jenkins workspace. On Windows,
+    # Jenkins may run as SYSTEM and Docker Desktop cannot access C:\Windows\Temp.
+    with tempfile.TemporaryDirectory(prefix="ai-remediation-scan-", dir=phase_dir) as temporary:
         reports = Path(temporary)
         report_mount = docker_volume_path(reports)
 
