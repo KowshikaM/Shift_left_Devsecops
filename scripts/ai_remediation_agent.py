@@ -331,7 +331,12 @@ def request_valid_patch(prompt, finding, target, root):
         if checked.returncode == 0:
             return proposal, model, patch
         if attempt == 0:
-            feedback = "The previous patch was rejected because it did not apply to the supplied original file. Return a corrected, minimal, non-empty unified diff that applies to that file."
+            diagnostic = (checked.stderr or checked.stdout).strip()[:1000]
+            feedback = (
+                "The previous patch was rejected by git apply --check against the supplied original file. "
+                f"Diagnostic: {diagnostic or 'no diagnostic text was returned'}. "
+                "Return a corrected, minimal, non-empty unified diff for the same single file."
+            )
             log("Groq patch did not apply; requesting one corrected diff")
     raise RuntimeError("Groq's corrected patch still does not apply cleanly")
 

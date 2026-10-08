@@ -39,6 +39,22 @@ class GroqClientTests(unittest.TestCase):
             with self.assertRaisesRegex(GroqRequestError, "rate limited"):
                 request_remediation("prompt", api_key="secret-value")
 
+    def test_rate_limit_retries_once_after_retry_after(self):
+        proposal = {"patch": "diff"}
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": json.dumps(proposal)}}]}).encode()
+        rate_limit = urllib.error.HTTPError(
+            "https://api.groq.com", 429, "limited", {"Retry-After": "0"}, Mock()
+        )
+        with patch("groq_client.urllib.request.urlopen", side_effect=[rate_limit, response]) as request:
+            with patch("groq_client.time.sleep") as sleep:
+                result, _ = request_remediation("prompt", api_key="secret-value")
+        self.assertEqual(result, proposal)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(0.0)
+
     def test_missing_key_and_malformed_response_fail_closed(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(GroqRequestError, "GROQ_API_KEY"):

@@ -107,7 +107,9 @@ class RemediationPolicyTests(unittest.TestCase):
                     request_valid_patch(prompt, finding, "app/index.js", root)
             self.assertEqual(request.call_count, 2)
             retry_prompt = json.loads(request.call_args_list[1].args[0])
-            self.assertIn("patch_validation_feedback", retry_prompt)
+            feedback = retry_prompt["patch_validation_feedback"]
+            self.assertIn("git apply --check", feedback)
+            self.assertIn("Diagnostic:", feedback)
             self.assertEqual(target_file.read_bytes(), original)
 
     def test_proposal_cannot_change_severity_or_target(self):
