@@ -17,6 +17,7 @@ import os
 import sqlite3
 import json
 import base64
+import hmac
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -31,6 +32,7 @@ JENKINS_URL = os.environ.get("JENKINS_URL", "http://localhost:8080")
 JENKINS_USER = os.environ.get("JENKINS_USER", "")
 JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN", "")
 JENKINS_FIX_JOB = os.environ.get("JENKINS_FIX_JOB", "ai-single-fix")
+DASHBOARD_CALLBACK_TOKEN = os.environ.get("DASHBOARD_CALLBACK_TOKEN", "")
 
 app = Flask(__name__, static_folder="static")
 
@@ -89,6 +91,7 @@ def init_db():
         "before_status": "ALTER TABLE findings ADD COLUMN before_status TEXT DEFAULT 'BLOCKED'",
         "after_status": "ALTER TABLE findings ADD COLUMN after_status TEXT DEFAULT 'PENDING'",
         "validation_summary": "ALTER TABLE findings ADD COLUMN validation_summary TEXT",
+        "ai_attempt_count": "ALTER TABLE findings ADD COLUMN ai_attempt_count INTEGER NOT NULL DEFAULT 0",
     }
     for column, statement in finding_migrations.items():
         if column not in finding_columns:
@@ -254,7 +257,9 @@ def list_tickets():
         policy = ticket_ai_policy(db, ticket)
         ticket["ai_eligible"] = policy["ai_eligible"]
         ticket["ai_block_reason"] = policy["reason"]
-        ticket["ai_action_available"] = policy["ai_eligible"] and bool(JENKINS_USER and JENKINS_API_TOKEN)
+        ticket["ai_action_available"] = policy["ai_eligible"] and bool(
+            JENKINS_USER and JENKINS_API_TOKEN and DASHBOARD_CALLBACK_TOKEN
+        )
     return jsonify(tickets)
 
 
@@ -333,7 +338,6 @@ def trigger_jenkins_fix_job(finding):
         "INSTALLED_VERSION": finding["installed_version"] or "",
         "FIXED_VERSION": finding["fixed_version"] or "",
         "TICKET_ID": str(finding["id"]),
-        "DASHBOARD_CALLBACK_URL": request.host_url.rstrip("/"),
     })
     url = f"{JENKINS_URL}/job/{JENKINS_FIX_JOB}/buildWithParameters?{params}"
 
@@ -370,28 +374,64 @@ def apply_ai_fix(finding_id):
             "remediation_reason": policy["reason"],
         }), 400
 
-    if not JENKINS_USER or not JENKINS_API_TOKEN:
-        detail = "Jenkins connection is not configured. Set JENKINS_USER and JENKINS_API_TOKEN in the local .env file, then recreate the dashboard container."
+    if not JENKINS_USER or not JENKINS_API_TOKEN or not DASHBOARD_CALLBACK_TOKEN:
+        detail = "Jenkins or callback authentication is not configured. Set JENKINS_USER, JENKINS_API_TOKEN, and DASHBOARD_CALLBACK_TOKEN in the local .env file, then recreate the dashboard container."
         log_event(finding["build_id"], finding_id, "ai_fix_trigger_failed", detail)
         return jsonify({"status": "error", "detail": detail}), 503
+
+    status = finding["status"] or "open"
+    remediation_status = finding["remediation_status"] or "PENDING"
+    is_first_attempt = status == "open"
+    is_explicit_retry = status == "manual_review_required" and remediation_status == "MANUAL_REVIEW"
+    if not (is_first_attempt or is_explicit_retry):
+        return jsonify({"status": "conflict", "detail": "This ticket already has an AI request in progress or is not in a retryable state."}), 409
+
+    # Reserve the ticket atomically before contacting Jenkins. Concurrent POSTs
+    # cannot enqueue duplicate remediation builds for the same finding.
+    cursor = db.execute(
+        """UPDATE findings SET status='ai_fix_requested', remediation_status='IN_PROGRESS',
+           ai_attempt_count=COALESCE(ai_attempt_count, 0) + 1, updated_at=?
+           WHERE id=? AND status=? AND COALESCE(remediation_status, 'PENDING')=?""",
+        (datetime.utcnow().isoformat(), finding_id, status, remediation_status),
+    )
+    db.commit()
+    if cursor.rowcount != 1:
+        return jsonify({"status": "conflict", "detail": "Another AI request already claimed this ticket."}), 409
 
     ok, error = trigger_jenkins_fix_job(finding)
 
     if ok:
-        db.execute("UPDATE findings SET status = 'ai_fix_requested', remediation_status = 'IN_PROGRESS', updated_at = ? WHERE id = ?",
-                   (datetime.utcnow().isoformat(), finding_id))
-        db.commit()
-        log_event(finding["build_id"], finding_id, "ai_fix_requested",
+        event = "ai_fix_retry_requested" if is_explicit_retry else "ai_fix_requested"
+        log_event(finding["build_id"], finding_id, event,
                   "Developer clicked Apply AI Fix")
         return jsonify({"status": "requested"})
     else:
+        db.execute(
+            """UPDATE findings SET status=?, remediation_status=?, updated_at=?
+               WHERE id=? AND status='ai_fix_requested' AND remediation_status='IN_PROGRESS'""",
+            (status, remediation_status, datetime.utcnow().isoformat(), finding_id),
+        )
+        db.commit()
         log_event(finding["build_id"], finding_id, "ai_fix_trigger_failed", error)
         return jsonify({"status": "error", "detail": error}), 502
+
+
+def require_jenkins_callback():
+    if not DASHBOARD_CALLBACK_TOKEN:
+        return jsonify({"error": "Jenkins callback authentication is not configured"}), 503
+    supplied = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not supplied.startswith(prefix) or not hmac.compare_digest(supplied[len(prefix):], DASHBOARD_CALLBACK_TOKEN):
+        return jsonify({"error": "unauthorized Jenkins callback"}), 401
+    return None
 
 
 @app.route("/api/tickets/<int:finding_id>/mark-pr-opened", methods=["POST"])
 def mark_pr_opened(finding_id):
     """Called by the Jenkins AI-fix job once it has opened the PR."""
+    unauthorized = require_jenkins_callback()
+    if unauthorized:
+        return unauthorized
     payload = request.get_json(force=True)
     db = get_db()
     db.execute(
@@ -407,6 +447,9 @@ def mark_pr_opened(finding_id):
 @app.route("/api/tickets/<int:finding_id>/validation-result", methods=["POST"])
 def update_validation_result(finding_id):
     """Update the existing ticket with the real post-remediation validation outcome."""
+    unauthorized = require_jenkins_callback()
+    if unauthorized:
+        return unauthorized
     payload = request.get_json(force=True) if request.data else {}
     db = get_db()
     finding = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()

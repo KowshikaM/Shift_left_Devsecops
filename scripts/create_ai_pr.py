@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, os, urllib.request, urllib.error
+from dashboard_callback import post_dashboard_callback
 
 def github_api(method, path, token, body=None):
     url = "https://api.github.com" + path
@@ -10,6 +11,9 @@ def github_api(method, path, token, body=None):
     req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
+
+def notify_dashboard_pr_opened(callback, ticket, payload, callback_token):
+    post_dashboard_callback(callback, ticket, "mark-pr-opened", payload, callback_token)
 
 def main():
     token = os.environ["GITHUB_TOKEN"]
@@ -44,22 +48,16 @@ def main():
     print(f"[ai-pr] PR: {url}")
 
     callback = os.environ.get("DASHBOARD_CALLBACK_URL", "").rstrip("/")
-    if callback:
-        payload = json.dumps({
+    try:
+        notify_dashboard_pr_opened(callback, ticket, {
             "explanation": explanation,
             "remediation": remediation,
             "pr_url": url,
             "provider": "Groq",
-        }).encode()
-        req = urllib.request.Request(
-            f"{callback}/api/tickets/{ticket}/mark-pr-opened",
-            data=payload, method="POST"
-        )
-        req.add_header("Content-Type", "application/json")
-        try:
-            urllib.request.urlopen(req, timeout=10)
-        except urllib.error.URLError as e:
-            print(f"[ai-pr] Dashboard callback failed: {e}")
+        }, os.environ.get("DASHBOARD_CALLBACK_TOKEN", ""))
+    except (urllib.error.URLError, RuntimeError) as e:
+        print(f"[ai-pr] Dashboard callback failed: {e}")
+        raise
 
 if __name__ == "__main__":
     main()

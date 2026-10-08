@@ -15,11 +15,11 @@ pipeline {
         string(name: 'INSTALLED_VERSION', defaultValue: '', description: 'Installed package version, when available')
         string(name: 'FIXED_VERSION', defaultValue: '', description: 'Scanner-recommended fixed version, when available')
         string(name: 'TICKET_ID', defaultValue: '', description: 'Dashboard finding ID')
-        string(name: 'DASHBOARD_CALLBACK_URL', defaultValue: 'http://localhost:2001', description: 'Dashboard callback URL')
     }
 
     environment {
         GITHUB_REPOSITORY = 'KowshikaM/Shift_left_Devsecops'
+        DASHBOARD_CALLBACK_URL = 'http://localhost:2001'
     }
 
     options {
@@ -148,10 +148,12 @@ pipeline {
 
         stage('Update Ticket Validation Status') {
             steps {
-                powershell '''
-                    python -c "import json, os, urllib.request; payload=json.load(open('.ai-fix-result.json', encoding='utf-8')); url=os.environ['DASHBOARD_CALLBACK_URL'].rstrip('/') + '/api/tickets/' + os.environ['TICKET_ID'] + '/validation-result'; req=urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), method='POST'); req.add_header('Content-Type','application/json'); urllib.request.urlopen(req, timeout=10); print('[AGENT] Dashboard ticket updated')"
-                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                '''
+                withCredentials([string(credentialsId: 'dashboard-callback-token', variable: 'DASHBOARD_CALLBACK_TOKEN')]) {
+                    powershell '''
+                        python scripts/dashboard_callback.py validation-result .ai-fix-result.json
+                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    '''
+                }
             }
         }
 
@@ -184,10 +186,12 @@ pipeline {
             }
             steps {
                 withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
-                    powershell '''
-                        python scripts/create_ai_pr.py
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                    '''
+                    withCredentials([string(credentialsId: 'dashboard-callback-token', variable: 'DASHBOARD_CALLBACK_TOKEN')]) {
+                        powershell '''
+                            python scripts/create_ai_pr.py
+                            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                        '''
+                    }
                 }
             }
         }

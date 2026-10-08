@@ -259,8 +259,9 @@ async function renderTickets() {
     const fallbackEligible = ["LOW", "MEDIUM"].includes(String(t.severity || "").toUpperCase()) && !containsSecret;
     const severityEligible = typeof t.ai_eligible === "boolean" ? t.ai_eligible : fallbackEligible;
     const requiresManualReview = ticketStatus === "manual_review_required";
-    const remediationType = severityEligible && !requiresManualReview ? "AI_ELIGIBLE" : "MANUAL";
-    const canApplyAi = ticketStatus === "open" && severityEligible && t.ai_action_available !== false;
+    const canRetryAi = requiresManualReview && t.remediation_status === "MANUAL_REVIEW";
+    const remediationType = severityEligible && (!requiresManualReview || canRetryAi) ? "AI_ELIGIBLE" : "MANUAL";
+    const canApplyAi = (ticketStatus === "open" || canRetryAi) && severityEligible && t.ai_action_available !== false;
     const vulnerabilityId = t.vulnerability_id || t.rule_id || "Unknown finding";
     const packageVersion = t.package_name
       ? `${t.package_name}${t.installed_version ? ` ${t.installed_version}` : ""}${t.fixed_version && t.fixed_version !== "-" ? ` -> ${t.fixed_version}` : ""}`
@@ -270,15 +271,15 @@ async function renderTickets() {
     const remediationReasonText = t.ai_block_reason || (requiresManualReview
       ? "The previous AI attempt did not pass validation. Manual remediation and review are required."
       : severityEligible
-        ? (t.ai_action_available === false ? "Jenkins is not configured. Set JENKINS_USER and JENKINS_API_TOKEN in the local .env file, then recreate the dashboard container." : "LOW/MEDIUM finding; a constrained Groq proposal can be validated before PR review.")
+        ? (t.ai_action_available === false ? "Jenkins or its callback authentication is not configured. Set JENKINS_USER, JENKINS_API_TOKEN, and DASHBOARD_CALLBACK_TOKEN in the local .env file, then recreate the dashboard container." : "LOW/MEDIUM finding; a constrained Groq proposal can be validated before PR review.")
         : (t.remediation_reason || "HIGH/CRITICAL or secret finding; manual remediation and review are required."));
     const remediationReason = `<div class="ticket-meta" style="margin-top: 0.5rem; color: var(--text-muted);">${escapeHtml(remediationReasonText)}</div>`;
     const beforeStatus = t.before_status || "BLOCKED";
     const afterStatus = t.after_status || "PENDING";
     const validationSummary = t.validation_summary || "Before: blocked. After: validation pending.";
-    const guideButton = remediationType === "MANUAL"
-      ? `<button class="btn" data-guide-ticket="${t.id}">View remediation guide</button>`
-      : `<button class="btn btn-primary" ${canApplyAi ? "" : "disabled"} onclick="applyAiFix(${t.id}, this)">Apply AI fix</button>`;
+      const guideButton = remediationType === "MANUAL"
+        ? `<button class="btn" data-guide-ticket="${t.id}">View remediation guide</button>`
+        : `<button class="btn btn-primary" ${canApplyAi ? "" : "disabled"} onclick="applyAiFix(${t.id}, this)">${canRetryAi ? "Retry AI fix" : "Apply AI fix"}</button>`;
 
     return `
     <div class="ticket-card">

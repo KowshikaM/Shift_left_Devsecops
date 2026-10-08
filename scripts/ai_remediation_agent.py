@@ -2,6 +2,7 @@
 """Deterministic controller for one LOW/MEDIUM Groq-assisted remediation."""
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -64,19 +65,43 @@ def save_report(path, content):
     path.write_text(content, encoding="utf-8")
 
 
+def parse_scanner_report(scanner, raw):
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError(f"{scanner} returned an empty report")
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{scanner} returned invalid JSON") from error
+    if scanner == "semgrep" and (not isinstance(report, dict) or not isinstance(report.get("results"), list)):
+        raise RuntimeError("Semgrep returned a JSON report with an invalid shape")
+    if scanner == "gitleaks" and not isinstance(report, list):
+        raise RuntimeError("Gitleaks returned a JSON report with an invalid shape")
+    if scanner == "trivy" and (not isinstance(report, dict) or not isinstance(report.get("Results"), list)):
+        raise RuntimeError("Trivy returned a JSON report with an invalid shape")
+    if scanner in {"dockerfile-policy", "k8s-policy"} and (not isinstance(report, list) or not report):
+        raise RuntimeError(f"{scanner} returned a JSON report with an invalid shape")
+    return report
+
+
 def docker_json_scan(root, report_dir, scanner, command, timeout=900):
     result = run(command, cwd=root, timeout=timeout, check=False, print_output=False)
     output_path = report_dir / f"{scanner}-results.json"
     if result.returncode >= 2:
         raise RuntimeError(f"{scanner} scanner execution failed (exit {result.returncode})")
     try:
-        if output_path.is_file():
-            return json.loads(output_path.read_text(encoding="utf-8-sig"))
-        return json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as error:
+        raw = output_path.read_text(encoding="utf-8-sig") if output_path.is_file() else result.stdout or ""
+        report = parse_scanner_report(scanner, raw)
+    except RuntimeError as error:
         if result.stderr:
             log(f"{scanner} diagnostics: {result.stderr[-2000:]}")
-        raise RuntimeError(f"{scanner} returned invalid JSON") from error
+        raise error
+    except OSError as error:
+        raise RuntimeError(f"{scanner} report could not be read") from error
+    if result.returncode == 1:
+        has_findings = bool(report.get("results")) if scanner == "semgrep" else bool(report)
+        if not has_findings:
+            raise RuntimeError(f"{scanner} returned exit code 1 with no findings in its report")
+    return report
 
 
 def scan_workspace(root, phase, ticket_id, *, build_image):
@@ -124,14 +149,17 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
             trivy_run = run(trivy_args, cwd=root, timeout=2100, check=False, print_output=False)
         finally:
             image_tar.unlink(missing_ok=True)
-        if trivy_run.returncode >= 2:
-            raise RuntimeError(f"Trivy scanner execution failed (exit {trivy_run.returncode})")
+        if trivy_run.returncode != 0:
+            detail = (trivy_run.stderr or "").strip()[-1000:]
+            raise RuntimeError(f"Trivy scanner execution failed (exit {trivy_run.returncode})" + (f": {detail}" if detail else ""))
         try:
-            trivy = json.loads(trivy_run.stdout or "")
-        except json.JSONDecodeError as error:
+            trivy = parse_scanner_report("trivy", trivy_run.stdout)
+        except RuntimeError as error:
             if trivy_run.stderr:
                 log(f"Trivy diagnostics: {trivy_run.stderr[-2000:]}")
-            raise RuntimeError("Trivy returned missing or invalid JSON") from error
+            raise error
+        if not isinstance(trivy, dict) or not isinstance(trivy.get("Results"), list):
+            raise RuntimeError("Trivy returned a JSON report with an invalid shape")
 
         log(f"Running Dockerfile and Kubernetes policy scans ({phase})")
         policy_results = {}
@@ -142,10 +170,7 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
             ], cwd=root, timeout=300, check=False)
             if policy.returncode >= 2:
                 raise RuntimeError(f"{scanner} scanner execution failed (exit {policy.returncode})")
-            try:
-                policy_results[scanner] = json.loads(policy.stdout or "[]")
-            except json.JSONDecodeError as error:
-                raise RuntimeError(f"{scanner} returned invalid JSON") from error
+            policy_results[scanner] = parse_scanner_report(scanner, policy.stdout)
 
         normalized_reports = {
             "trivy-results.json": trivy,
@@ -216,20 +241,18 @@ def sanitize_context(value):
 
 
 def make_prompt(finding, path, source_text, root):
-    context_path = root / "README.md"
-    project_context = context_path.read_text(encoding="utf-8", errors="replace")[:4000] if context_path.is_file() else ""
+    source_text = source_text.replace("\r\n", "\n").replace("\r", "\n")
     recommendation = finding.get("scanner_recommendation") or "No explicit scanner recommendation was supplied."
     return json.dumps({
-        "task": "Propose one minimal security remediation using a unified diff for exactly the affected file.",
+        "task": "Propose one minimal security remediation as an exact-text edit to exactly the affected file.",
         "constraints": [
-            "The diff must modify only the supplied affected file and must apply with git apply.",
-            f"The patch field must contain only a unified diff for {path}: its first two lines must be '--- a/{path}' and '+++ b/{path}'.",
-            "Include at least one real hunk header in the form @@ -<numeric-start>[,<numeric-count>] +<numeric-start>[,<numeric-count>] @@; calculate valid ranges from the supplied file.",
-            "Use unified-diff body lines only: context starts with one space, removals with -, additions with +. Include a real change.",
-            "Do not put Markdown fences, a language label, apply_patch markers, or explanations inside the patch string.",
+            f"The file field must be exactly {path}.",
+            "The find field must be a non-empty exact contiguous excerpt from affected_file_content and must occur exactly once.",
+            "The replace field must contain only replacement source text, not a patch or instructions; make a real minimal change.",
+            "Do not include Markdown, diff headers, patch markers, or code fences in find or replace.",
             "Do not output shell commands, scripts to execute, credentials, URLs, or new dependencies.",
             "Do not change unrelated behavior. The Python controller, not you, runs all tests and scanners.",
-            "Return the required structured JSON fields; use a unified diff in patch.",
+            "Return one JSON object matching the response schema.",
         ],
         "vulnerability": {
             "vulnerability_id": finding["vulnerability_id"], "severity": finding["severity"],
@@ -238,29 +261,52 @@ def make_prompt(finding, path, source_text, root):
             "installed_version": finding.get("installed_version"), "fixed_version": finding.get("fixed_version"),
             "description": finding.get("description"), "scanner_recommendation": recommendation,
         },
-        "project_context": project_context,
         "affected_file_content": sanitize_context(source_text),
         "required_json": {
             "vulnerability_id": "same as input", "severity": "same as input",
-            "affected_file": "same as input", "analysis": "cause and impact",
-            "remediation": "concise proposed fix", "patch": f"only the raw unified diff for {path}, with ---/+++ file headers and at least one numeric @@ hunk header",
+            "file": path, "analysis": "cause and impact",
+            "remediation": "concise proposed fix", "find": "exact existing source excerpt",
+            "replace": "replacement source excerpt",
             "confidence": "HIGH, MEDIUM, or LOW", "tests_required": True,
             "reason": "why this is the minimal safe change",
         },
     }, ensure_ascii=False)
 
 
+def remediation_response_schema(finding, target):
+    return {
+        "type": "object",
+        "properties": {
+            "vulnerability_id": {"type": "string", "enum": [finding["vulnerability_id"]]},
+            "severity": {"type": "string", "enum": [finding["severity"]]},
+            "file": {"type": "string", "enum": [target]},
+            "analysis": {"type": "string"},
+            "remediation": {"type": "string"},
+            "find": {"type": "string"},
+            "replace": {"type": "string"},
+            "confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+            "tests_required": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "vulnerability_id", "severity", "file", "analysis", "remediation",
+            "find", "replace", "confidence", "tests_required", "reason",
+        ],
+        "additionalProperties": False,
+    }
+
+
 def validate_proposal(proposal, finding, target):
-    required = ("vulnerability_id", "severity", "affected_file", "analysis", "remediation", "patch", "confidence", "tests_required", "reason")
+    required = ("vulnerability_id", "severity", "file", "analysis", "remediation", "find", "replace", "confidence", "tests_required", "reason")
     if any(key not in proposal for key in required):
         raise RuntimeError("Groq proposal is missing required structured fields")
     if str(proposal["vulnerability_id"]).lower() != finding["vulnerability_id"].lower():
         raise RuntimeError("Groq proposal changed the vulnerability ID")
     if str(proposal["severity"]).upper() != finding["severity"].upper():
         raise RuntimeError("Groq proposal changed the finding severity")
-    if normalized_repo_path(proposal["affected_file"]) != target:
+    if proposal["file"] != target:
         raise RuntimeError("Groq proposal targets a different file")
-    for key in ("analysis", "remediation", "patch", "reason"):
+    for key in ("analysis", "remediation", "find", "replace", "reason"):
         if not isinstance(proposal[key], str) or not proposal[key].strip():
             raise RuntimeError(f"Groq proposal field {key} must be non-empty text")
     if str(proposal["confidence"]).upper() not in {"HIGH", "MEDIUM", "LOW"}:
@@ -269,7 +315,41 @@ def validate_proposal(proposal, finding, target):
         raise RuntimeError("Groq confidence is low; manual review is required")
     if proposal["tests_required"] is not True:
         raise RuntimeError("Groq proposal must require tests")
-    return proposal["patch"]
+    return proposal
+
+
+def apply_exact_edit(source_text, proposal, target):
+    old_text = proposal["find"].replace("\r\n", "\n").replace("\r", "\n")
+    new_text = proposal["replace"].replace("\r\n", "\n").replace("\r", "\n")
+    if not old_text.strip() or not new_text.strip():
+        raise RuntimeError("Structured edit must contain non-empty find and replace text")
+    if old_text == new_text:
+        raise RuntimeError("Structured edit does not change the source")
+    newline_styles = set(re.findall(r"\r\n|\r|\n", source_text))
+    if len(newline_styles) > 1:
+        raise RuntimeError("Target file has mixed line endings; manual review is required")
+    newline = next(iter(newline_styles), "\n")
+    normalized_source = source_text.replace("\r\n", "\n").replace("\r", "\n")
+    occurrences = normalized_source.count(old_text)
+    if occurrences != 1:
+        raise RuntimeError(f"Exact target text must occur once in {target}; found {occurrences}")
+    updated = normalized_source.replace(old_text, new_text, 1)
+    if newline != "\n":
+        updated = updated.replace("\n", newline)
+    return updated
+
+
+def generate_unified_patch(source_text, updated_text, target):
+    source_lf = source_text.replace("\r\n", "\n").replace("\r", "\n")
+    updated_lf = updated_text.replace("\r\n", "\n").replace("\r", "\n")
+    patch = "".join(difflib.unified_diff(
+        source_lf.splitlines(keepends=True), updated_lf.splitlines(keepends=True),
+        fromfile=f"a/{target}", tofile=f"b/{target}", n=3,
+    ))
+    if not patch:
+        raise RuntimeError("Structured edit produced no source changes")
+    validate_patch(patch, target)
+    return patch
 
 
 def validate_patch(patch, target):
@@ -293,52 +373,38 @@ def validate_patch(patch, target):
         raise RuntimeError("Patch must contain at least one unified-diff hunk")
 
 
-def normalize_patch_format(patch):
-    """Remove only a single outer Markdown diff fence; leave diff bytes intact."""
-    if not isinstance(patch, str):
-        return patch
-    match = re.fullmatch(r"[ \t]*```(?:diff)?[ \t]*\r?\n(.*?)\r?\n```[ \t]*", patch, re.IGNORECASE | re.DOTALL)
-    return match.group(1) if match else patch
-
-
-def request_valid_patch(prompt, finding, target, root):
+def request_valid_patch(prompt, finding, target, root, source_text):
     feedback = None
     for attempt in range(2):
         request_prompt = prompt
         if feedback:
             request_data = json.loads(prompt)
-            request_data["patch_validation_feedback"] = feedback
+            request_data["edit_validation_feedback"] = feedback
             request_data["constraints"].append(
-                "Return a real unified diff: --- a/<affected_file>, +++ b/<affected_file>, then an @@ hunk with context/deletion/addition lines. "
-                "Do not use Markdown fences, explanation text, or apply_patch markers."
+                "Return only the structured exact-text edit fields required by the schema; do not return a diff or patch."
             )
             request_prompt = json.dumps(request_data, ensure_ascii=False)
-        proposal, model = request_remediation(request_prompt)
-        patch = validate_proposal(proposal, finding, target)
-        patch = normalize_patch_format(patch)
-        try:
-            validate_patch(patch, target)
-        except RuntimeError as exc:
-            if "unified-diff hunk" not in str(exc) or attempt != 0:
-                raise
-            feedback = "The previous patch was rejected because it contained no unified-diff hunk. Return a corrected, minimal, non-empty unified diff that applies to the supplied original file."
-            log("Groq returned no diff hunk; requesting one corrected diff")
-            continue
+        proposal, model = request_remediation(
+            request_prompt, response_schema=remediation_response_schema(finding, target),
+        )
+        proposal = validate_proposal(proposal, finding, target)
+        updated_text = apply_exact_edit(source_text, proposal, target)
+        patch = generate_unified_patch(source_text, updated_text, target)
         checked = run(
             ["git", "apply", "--check", "--"], cwd=root,
             input_text=patch, check=False, print_output=False,
         )
         if checked.returncode == 0:
-            return proposal, model, patch
+            return proposal, model, patch, updated_text
         if attempt == 0:
             diagnostic = (checked.stderr or checked.stdout).strip()[:1000]
             feedback = (
-                "The previous patch was rejected by git apply --check against the supplied original file. "
+                "The exact-text edit generated a patch rejected by git apply --check against the supplied original file. "
                 f"Diagnostic: {diagnostic or 'no diagnostic text was returned'}. "
-                "Return a corrected, minimal, non-empty unified diff for the same single file."
+                "Return a corrected exact-text find/replace edit for the same single file."
             )
-            log("Groq patch did not apply; requesting one corrected diff")
-    raise RuntimeError("Groq's corrected patch still does not apply cleanly")
+            log("Controller-generated patch failed git apply --check; requesting one corrected edit")
+    raise RuntimeError("Controller-generated patch still does not apply cleanly")
 
 
 def run_project_tests(root, image_ref):
@@ -442,7 +508,7 @@ def remediate(args):
         log("Inspecting affected file and scanner context")
         prompt = make_prompt(finding, target, source_text, root)
         log("Requesting structured remediation proposal from Groq")
-        proposal, model, patch = request_valid_patch(prompt, finding, target, root)
+        proposal, model, patch, updated_text = request_valid_patch(prompt, finding, target, root, source_text)
         result.update({
             "analysis": proposal["analysis"], "proposed_remediation": proposal["remediation"],
             "reason": proposal["reason"], "model": model,
@@ -452,6 +518,8 @@ def remediate(args):
         if applied.returncode != 0:
             raise RuntimeError("Git could not apply the validated patch")
         modified = True
+        if full_path.read_bytes().decode("utf-8") != updated_text:
+            raise RuntimeError("Applied patch did not produce the exact validated edit")
         result["files_changed"] = [target]
 
         log("Building patched image and running tests")
