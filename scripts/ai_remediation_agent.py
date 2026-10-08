@@ -24,16 +24,18 @@ def log(message):
     print(f"[AGENT] {message}", flush=True)
 
 
-def run(command, *, cwd, timeout=900, input_text=None, check=True):
+def run(command, *, cwd, timeout=900, input_text=None, check=True, print_output=True):
     result = subprocess.run(
         command, cwd=str(cwd), input=input_text, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
         encoding="utf-8", errors="replace", shell=False, check=False,
     )
-    if result.stdout:
+    if print_output and (result.stdout or result.stderr):
         encoding = sys.stdout.encoding or "utf-8"
-        printable = result.stdout.encode(encoding, errors="replace").decode(encoding)
-        print(printable.rstrip(), flush=True)
+        for output in (result.stdout, result.stderr):
+            if output:
+                printable = output.encode(encoding, errors="replace").decode(encoding)
+                print(printable.rstrip(), flush=True)
     if check and result.returncode != 0:
         raise RuntimeError(f"Approved command failed (exit {result.returncode}): {Path(command[0]).name}")
     return result
@@ -63,7 +65,7 @@ def save_report(path, content):
 
 
 def docker_json_scan(root, report_dir, scanner, command, timeout=900):
-    result = run(command, cwd=root, timeout=timeout, check=False)
+    result = run(command, cwd=root, timeout=timeout, check=False, print_output=False)
     output_path = report_dir / f"{scanner}-results.json"
     if result.returncode >= 2:
         raise RuntimeError(f"{scanner} scanner execution failed (exit {result.returncode})")
@@ -72,6 +74,8 @@ def docker_json_scan(root, report_dir, scanner, command, timeout=900):
             return json.loads(output_path.read_text(encoding="utf-8-sig"))
         return json.loads(result.stdout or "{}")
     except json.JSONDecodeError as error:
+        if result.stderr:
+            log(f"{scanner} diagnostics: {result.stderr[-2000:]}")
         raise RuntimeError(f"{scanner} returned invalid JSON") from error
 
 
@@ -112,12 +116,14 @@ def scan_workspace(root, phase, ticket_id, *, build_image):
             "docker", "run", "--rm", "--user", "0:0", "-v", f"{mount}:/src", "aquasec/trivy:latest",
             "image", "--input", f"{container_reports}/image.tar", "--format", "json", "--quiet",
             "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--timeout", "10m",
-        ], cwd=root, timeout=900, check=False)
+        ], cwd=root, timeout=900, check=False, print_output=False)
         if trivy_run.returncode >= 2:
             raise RuntimeError(f"Trivy scanner execution failed (exit {trivy_run.returncode})")
         try:
             trivy = json.loads(trivy_run.stdout or "")
         except json.JSONDecodeError as error:
+            if trivy_run.stderr:
+                log(f"Trivy diagnostics: {trivy_run.stderr[-2000:]}")
             raise RuntimeError("Trivy returned missing or invalid JSON") from error
 
         log(f"Running Dockerfile and Kubernetes policy scans ({phase})")
