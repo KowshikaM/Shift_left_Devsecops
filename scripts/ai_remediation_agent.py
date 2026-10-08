@@ -282,6 +282,42 @@ def validate_patch(patch, target):
         raise RuntimeError("Patch must modify exactly the reported file")
     if any(part == ".." for part in target.replace("\\", "/").split("/")):
         raise RuntimeError("Patch path traversal is not allowed")
+    if not any(line.startswith("@@ ") for line in patch.splitlines()):
+        raise RuntimeError("Patch must contain at least one unified-diff hunk")
+
+
+def request_valid_patch(prompt, finding, target, root):
+    feedback = None
+    for attempt in range(2):
+        request_prompt = prompt
+        if feedback:
+            request_data = json.loads(prompt)
+            request_data["patch_validation_feedback"] = feedback
+            request_data["constraints"].append(
+                "Return a real unified diff: --- a/<affected_file>, +++ b/<affected_file>, then an @@ hunk with context/deletion/addition lines. "
+                "Do not use Markdown fences, explanation text, or apply_patch markers."
+            )
+            request_prompt = json.dumps(request_data, ensure_ascii=False)
+        proposal, model = request_remediation(request_prompt)
+        patch = validate_proposal(proposal, finding, target)
+        try:
+            validate_patch(patch, target)
+        except RuntimeError as exc:
+            if "unified-diff hunk" not in str(exc) or attempt != 0:
+                raise
+            feedback = "The previous patch was rejected because it contained no unified-diff hunk. Return a corrected, minimal, non-empty unified diff that applies to the supplied original file."
+            log("Groq returned no diff hunk; requesting one corrected diff")
+            continue
+        checked = run(
+            ["git", "apply", "--check", "--"], cwd=root,
+            input_text=patch, check=False, print_output=False,
+        )
+        if checked.returncode == 0:
+            return proposal, model, patch
+        if attempt == 0:
+            feedback = "The previous patch was rejected because it did not apply to the supplied original file. Return a corrected, minimal, non-empty unified diff that applies to that file."
+            log("Groq patch did not apply; requesting one corrected diff")
+    raise RuntimeError("Groq's corrected patch still does not apply cleanly")
 
 
 def run_project_tests(root, image_ref):
@@ -385,17 +421,12 @@ def remediate(args):
         log("Inspecting affected file and scanner context")
         prompt = make_prompt(finding, target, source_text, root)
         log("Requesting structured remediation proposal from Groq")
-        proposal, model = request_remediation(prompt)
-        patch = validate_proposal(proposal, finding, target)
-        validate_patch(patch, target)
+        proposal, model, patch = request_valid_patch(prompt, finding, target, root)
         result.update({
             "analysis": proposal["analysis"], "proposed_remediation": proposal["remediation"],
             "reason": proposal["reason"], "model": model,
         })
         log("Validating one-file patch")
-        checked = run(["git", "apply", "--check", "--"], cwd=root, input_text=patch, check=False)
-        if checked.returncode != 0:
-            raise RuntimeError("Proposed patch does not apply cleanly")
         applied = run(["git", "apply", "--"], cwd=root, input_text=patch, check=False)
         if applied.returncode != 0:
             raise RuntimeError("Git could not apply the validated patch")
