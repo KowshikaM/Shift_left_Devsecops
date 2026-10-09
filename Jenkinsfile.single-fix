@@ -192,7 +192,10 @@ pipeline {
                         $env:GCM_INTERACTIVE = 'Never'
                         $env:GIT_CONFIG_COUNT = '1'
                         $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
-                        $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: bearer $env:GITHUB_TOKEN"
+                        $gitAuth = [Convert]::ToBase64String(
+                            [Text.Encoding]::ASCII.GetBytes("x-access-token:$env:GITHUB_TOKEN")
+                        )
+                        $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $gitAuth"
                         $gitTimeoutOptions = @(
                             '-c', 'http.connectTimeout=15',
                             '-c', 'http.lowSpeedLimit=1000',
@@ -249,6 +252,7 @@ pipeline {
                                 Write-Host "[ai-pr] Validated branch push completed"
                             }
                         } finally {
+                            $gitAuth = $null
                             Remove-Item Env:GIT_CONFIG_COUNT -ErrorAction SilentlyContinue
                             Remove-Item Env:GIT_CONFIG_KEY_0 -ErrorAction SilentlyContinue
                             Remove-Item Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
