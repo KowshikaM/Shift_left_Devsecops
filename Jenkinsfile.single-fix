@@ -175,12 +175,10 @@ pipeline {
                     powershell '''
                         $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
                         $branch = ([string]$result.branch).Trim()
-                        $branchPattern = '\Aai-remediation/ticket-[0-9]+\z'
-
                         Write-Host "[ai-pr] Branch value: [$branch]"
                         Write-Host "[ai-pr] Branch length: $($branch.Length)"
 
-                        if (-not [regex]::IsMatch($branch, $branchPattern)) {
+                        if ($branch -notmatch '^ai-remediation/ticket-[0-9]+$') {
                             throw "Invalid branch from result JSON. Value=[$branch], Length=$($branch.Length)"
                         }
 
