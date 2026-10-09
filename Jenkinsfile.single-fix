@@ -205,6 +205,13 @@ pipeline {
                             $gitExit = $LASTEXITCODE
 
                             if ($gitExit -ne 0) {
+                                $lookupError = ($remoteRef | Out-String).Trim()
+                                if ($env:GITHUB_TOKEN) {
+                                    $lookupError = $lookupError.Replace($env:GITHUB_TOKEN, '[REDACTED]')
+                                }
+                                if ($lookupError) {
+                                    throw "Remote branch lookup failed (git exit $gitExit). Git reported: $lookupError"
+                                }
                                 throw "Remote branch lookup failed (git exit $gitExit). Check GitHub authentication and network connectivity."
                             }
 
