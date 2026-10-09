@@ -174,10 +174,17 @@ pipeline {
                 withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
                     powershell '''
                         $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
-                        $branch = [string]$result.branch
-                        if ($branch -notmatch '^ai-remediation/ticket-[0-9]+$') {
-                            throw "Agent returned an invalid isolated branch name."
+                        $branch = ([string]$result.branch).Trim()
+                        $branchPattern = '\Aai-remediation/ticket-[0-9]+\z'
+
+                        Write-Host "[ai-pr] Branch value: [$branch]"
+                        Write-Host "[ai-pr] Branch length: $($branch.Length)"
+
+                        if (-not [regex]::IsMatch($branch, $branchPattern)) {
+                            throw "Invalid branch from result JSON. Value=[$branch], Length=$($branch.Length)"
                         }
+
+                        Write-Host "[ai-pr] Branch validation passed"
                         if ($result.status -ne "PASS" -or $result.test_status -ne "PASS" -or $result.rescan_status -ne "PASS") {
                             throw "Validated tests and post-remediation scans are required before publishing the branch."
                         }
