@@ -19,6 +19,8 @@ A failed build is retained in dashboard history. Only a passing build on `main` 
 - Only LOW and MEDIUM non-secret findings are AI-eligible. HIGH, CRITICAL, Gitleaks, and secret-like findings require manual review.
 - Python controls the AI workflow: scanner baseline, structured proposal validation, one-file unified patch, project tests, complete rescan, before/after comparison, rollback on failure, and isolated commit on success.
 - The AI workflow creates a branch and PR only after validation. It never merges or deploys. The normal main pipeline gate still controls deployment.
+- The focused Jenkins job uses a stable `ai-remediation/ticket-<id>` branch, non-interactive Git authentication, a five-minute branch-stage timeout, a three-minute PR-stage timeout, a 15-second Git connect timeout and 30-second low-speed cutoff, 30-second GitHub API request timeouts, and the dashboard callback's 10-second timeout. Retries reuse matching branches/open PRs; a branch with different content is never overwritten, and closed PRs require human review.
+- If validation passes but branch/PR publication does not complete, the authenticated callback records `PR_CREATION_INCOMPLETE` on the ticket without changing the passing test/rescan evidence. The eligible ticket can be retried from the dashboard after checking Jenkins/GitHub; matching branches and open PRs are safely reused.
 - Human review/merge remains mandatory.
 - Manual remediation remains available when AI is unavailable.
 

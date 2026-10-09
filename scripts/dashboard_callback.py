@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 
 TRUSTED_DASHBOARD_CALLBACK_URL = "http://localhost:2001"
-ALLOWED_ENDPOINTS = {"validation-result", "mark-pr-opened"}
+ALLOWED_ENDPOINTS = {"validation-result", "mark-pr-opened", "mark-pr-failed"}
 
 
 def validate_callback_url(value):

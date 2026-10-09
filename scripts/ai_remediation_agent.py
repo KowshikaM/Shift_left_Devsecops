@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 from groq_client import request_remediation
@@ -422,8 +421,20 @@ def run_project_tests(root, image_ref):
 
 def git_branch(root, ticket_id):
     run(["git", "rev-parse", "--is-inside-work-tree"], cwd=root)
-    branch = f"ai-remediation/ticket-{ticket_id}-{int(time.time())}"
-    run(["git", "checkout", "-b", branch], cwd=root)
+    if not str(ticket_id).isdigit():
+        raise RuntimeError("Ticket ID must be numeric before creating a remediation branch")
+    branch = f"ai-remediation/ticket-{ticket_id}"
+    existing = run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=root, check=False,
+    )
+    if existing.returncode not in {0, 1}:
+        raise RuntimeError("Could not inspect the workspace-local remediation branch")
+    if existing.returncode == 0:
+        log(f"Resetting the workspace-local retry branch {branch} to the checked-out source revision")
+        run(["git", "checkout", "-B", branch], cwd=root)
+    else:
+        run(["git", "checkout", "-b", branch], cwd=root)
     return branch
 
 

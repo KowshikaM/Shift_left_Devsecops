@@ -158,19 +158,92 @@ pipeline {
         }
 
         stage('Create Validated Branch and PR') {
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
             when {
                 expression { return fileExists('gate-status.txt') && readFile('gate-status.txt').trim() == 'PASS' }
             }
             steps {
+                script {
+                    env.PR_CREATION_STARTED = 'true'
+                }
+                powershell '''
+                    Remove-Item ".ai-pr-result.json", ".ai-pr-failure.json" -Force -ErrorAction SilentlyContinue
+                '''
                 withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
                     powershell '''
                         $result = Get-Content ".ai-fix-result.json" -Raw | ConvertFrom-Json
                         $branch = [string]$result.branch
-                        if ($branch -notmatch '^ai-remediation/ticket-[0-9]+-[0-9]+$') {
+                        if ($branch -notmatch '^ai-remediation/ticket-[0-9]+$') {
                             throw "Agent returned an invalid isolated branch name."
                         }
-                        git -c "http.extraheader=AUTHORIZATION: bearer $env:GITHUB_TOKEN" push -u origin $branch
-                        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                        if ($result.status -ne "PASS" -or $result.test_status -ne "PASS" -or $result.rescan_status -ne "PASS") {
+                            throw "Validated tests and post-remediation scans are required before publishing the branch."
+                        }
+
+                        Write-Host "[ai-pr] Preparing authenticated, non-interactive Git operations for $branch"
+                        $env:GIT_TERMINAL_PROMPT = '0'
+                        $env:GCM_INTERACTIVE = 'Never'
+                        $env:GIT_CONFIG_COUNT = '1'
+                        $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+                        $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: bearer $env:GITHUB_TOKEN"
+                        $gitTimeoutOptions = @(
+                            '-c', 'http.connectTimeout=15',
+                            '-c', 'http.lowSpeedLimit=1000',
+                            '-c', 'http.lowSpeedTime=30'
+                        )
+                        try {
+                            Write-Host "[ai-pr] Checking whether the remote ticket branch exists"
+
+                            $remoteRef = & git @gitTimeoutOptions ls-remote --heads origin "refs/heads/$branch" 2>&1
+                            $gitExit = $LASTEXITCODE
+
+                            if ($gitExit -ne 0) {
+                                throw "Remote branch lookup failed (git exit $gitExit). Check GitHub authentication and network connectivity."
+                            }
+
+                            if ($remoteRef -match "refs/heads/$([regex]::Escape($branch))") {
+                                Write-Host "[ai-pr] Remote branch exists; verifying its tree"
+
+                                & git @gitTimeoutOptions fetch --no-tags origin "refs/heads/$branch"
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "Failed to fetch the existing remediation branch."
+                                }
+
+                                $localTree = (& git rev-parse "HEAD^{tree}").Trim()
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "Could not inspect the local validated commit tree."
+                                }
+
+                                $remoteTree = (& git rev-parse "FETCH_HEAD^{tree}").Trim()
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "Could not inspect the existing remote branch tree."
+                                }
+
+                                if ($localTree -ne $remoteTree) {
+                                    throw "Remote branch has different content; refusing to overwrite it."
+                                }
+
+                                Write-Host "[ai-pr] Existing branch matches; push skipped"
+                            } else {
+                                Write-Host "[ai-pr] Remote branch is absent; pushing validated commit"
+
+                                & git @gitTimeoutOptions push -u origin $branch
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "Git push failed. Check the Jenkins build log."
+                                }
+
+                                Write-Host "[ai-pr] Validated branch push completed"
+                            }
+                        } finally {
+                            Remove-Item Env:GIT_CONFIG_COUNT -ErrorAction SilentlyContinue
+                            Remove-Item Env:GIT_CONFIG_KEY_0 -ErrorAction SilentlyContinue
+                            Remove-Item Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+                            Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue
+                            Remove-Item Env:GCM_INTERACTIVE -ErrorAction SilentlyContinue
+                            Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+                        }
                         $branch | Set-Content "ai-branch.txt"
                     '''
                 }
@@ -181,6 +254,9 @@ pipeline {
         }
 
         stage('Open GitHub PR') {
+            options {
+                timeout(time: 3, unit: 'MINUTES')
+            }
             when {
                 expression { return fileExists('gate-status.txt') && readFile('gate-status.txt').trim() == 'PASS' }
             }
@@ -188,10 +264,14 @@ pipeline {
                 withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
                     withCredentials([string(credentialsId: 'dashboard-callback-token', variable: 'DASHBOARD_CALLBACK_TOKEN')]) {
                         powershell '''
+                            Write-Host "[ai-pr] Creating or reusing the pull request for $env:AI_BRANCH"
                             python scripts/create_ai_pr.py
                             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                         '''
                     }
+                }
+                script {
+                    env.PR_CREATION_SUCCEEDED = 'true'
                 }
             }
         }
@@ -216,6 +296,30 @@ pipeline {
 
     post {
         always { echo "AI remediation job finished for ticket #${params.TICKET_ID}" }
-        failure { echo 'Remediation failed validation or requires manual review.' }
+        unsuccessful {
+            echo 'Remediation failed validation or branch/PR publication did not complete.'
+            script {
+                if (env.PR_CREATION_STARTED == 'true' && env.PR_CREATION_SUCCEEDED != 'true') {
+                    withCredentials([string(credentialsId: 'dashboard-callback-token', variable: 'DASHBOARD_CALLBACK_TOKEN')]) {
+                        powershell '''
+                            if (Test-Path ".ai-pr-result.json") {
+                                Write-Host "[ai-pr] Retrying the authenticated dashboard callback for the created PR"
+                                python scripts/dashboard_callback.py mark-pr-opened .ai-pr-result.json
+                            } else {
+                                Write-Host "[ai-pr] Reporting incomplete branch/PR publication to the dashboard"
+                                @{
+                                    detail = "Branch push or pull-request publication did not complete; inspect this Jenkins build and GitHub before retrying."
+                                } | ConvertTo-Json | Set-Content ".ai-pr-failure.json" -Encoding ASCII
+                                python scripts/dashboard_callback.py mark-pr-failed .ai-pr-failure.json
+                            }
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Error "Authenticated dashboard callback could not record the branch/PR outcome."
+                                exit $LASTEXITCODE
+                            }
+                        '''
+                    }
+                }
+            }
+        }
     }
 }

@@ -259,7 +259,8 @@ async function renderTickets() {
     const fallbackEligible = ["LOW", "MEDIUM"].includes(String(t.severity || "").toUpperCase()) && !containsSecret;
     const severityEligible = typeof t.ai_eligible === "boolean" ? t.ai_eligible : fallbackEligible;
     const requiresManualReview = ticketStatus === "manual_review_required";
-    const canRetryAi = requiresManualReview && t.remediation_status === "MANUAL_REVIEW";
+    const publicationIncomplete = ticketStatus === "ai_fix_validated" && t.remediation_status === "PR_CREATION_INCOMPLETE";
+    const canRetryAi = (requiresManualReview && t.remediation_status === "MANUAL_REVIEW") || publicationIncomplete;
     const remediationType = severityEligible && (!requiresManualReview || canRetryAi) ? "AI_ELIGIBLE" : "MANUAL";
     const canApplyAi = (ticketStatus === "open" || canRetryAi) && severityEligible && t.ai_action_available !== false;
     const vulnerabilityId = t.vulnerability_id || t.rule_id || "Unknown finding";
@@ -268,11 +269,13 @@ async function renderTickets() {
       : "";
     const safePrUrl = /^https:\/\/github\.com\/[^\s]+\/pull\/\d+\/?$/.test(String(t.pr_url || "")) ? t.pr_url : "";
     const prLink = safePrUrl ? `<a href="${escapeHtml(safePrUrl)}" target="_blank" rel="noopener">View PR</a>` : "";
-    const remediationReasonText = t.ai_block_reason || (requiresManualReview
-      ? "The previous AI attempt did not pass validation. Manual remediation and review are required."
-      : severityEligible
-        ? (t.ai_action_available === false ? "Jenkins or its callback authentication is not configured. Set JENKINS_USER, JENKINS_API_TOKEN, and DASHBOARD_CALLBACK_TOKEN in the local .env file, then recreate the dashboard container." : "LOW/MEDIUM finding; a constrained Groq proposal can be validated before PR review.")
-        : (t.remediation_reason || "HIGH/CRITICAL or secret finding; manual remediation and review are required."));
+    const remediationReasonText = t.ai_block_reason || (publicationIncomplete
+      ? "Validation passed, but branch/PR publication did not complete. Check Jenkins and GitHub, then retry; matching branches and open PRs are reused."
+      : requiresManualReview
+        ? "The previous AI attempt did not pass validation. Manual remediation and review are required."
+        : severityEligible
+          ? (t.ai_action_available === false ? "Jenkins or its callback authentication is not configured. Set JENKINS_USER, JENKINS_API_TOKEN, and DASHBOARD_CALLBACK_TOKEN in the local .env file, then recreate the dashboard container." : "LOW/MEDIUM finding; a constrained Groq proposal can be validated before PR review.")
+          : (t.remediation_reason || "HIGH/CRITICAL or secret finding; manual remediation and review are required."));
     const remediationReason = `<div class="ticket-meta" style="margin-top: 0.5rem; color: var(--text-muted);">${escapeHtml(remediationReasonText)}</div>`;
     const beforeStatus = t.before_status || "BLOCKED";
     const afterStatus = t.after_status || "PENDING";

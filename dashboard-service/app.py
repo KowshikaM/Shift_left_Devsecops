@@ -383,7 +383,8 @@ def apply_ai_fix(finding_id):
     remediation_status = finding["remediation_status"] or "PENDING"
     is_first_attempt = status == "open"
     is_explicit_retry = status == "manual_review_required" and remediation_status == "MANUAL_REVIEW"
-    if not (is_first_attempt or is_explicit_retry):
+    is_publication_retry = status == "ai_fix_validated" and remediation_status == "PR_CREATION_INCOMPLETE"
+    if not (is_first_attempt or is_explicit_retry or is_publication_retry):
         return jsonify({"status": "conflict", "detail": "This ticket already has an AI request in progress or is not in a retryable state."}), 409
 
     # Reserve the ticket atomically before contacting Jenkins. Concurrent POSTs
@@ -401,7 +402,10 @@ def apply_ai_fix(finding_id):
     ok, error = trigger_jenkins_fix_job(finding)
 
     if ok:
-        event = "ai_fix_retry_requested" if is_explicit_retry else "ai_fix_requested"
+        event = (
+            "ai_fix_pr_retry_requested" if is_publication_retry
+            else ("ai_fix_retry_requested" if is_explicit_retry else "ai_fix_requested")
+        )
         log_event(finding["build_id"], finding_id, event,
                   "Developer clicked Apply AI Fix")
         return jsonify({"status": "requested"})
@@ -434,13 +438,41 @@ def mark_pr_opened(finding_id):
         return unauthorized
     payload = request.get_json(force=True)
     db = get_db()
-    db.execute(
-        "UPDATE findings SET status = 'ai_fix_pr_opened', remediation_status = 'PR_OPENED', ai_explanation = ?, pr_url = ?, updated_at = ? WHERE id = ?",
+    cursor = db.execute(
+        """UPDATE findings SET status = 'ai_fix_pr_opened', remediation_status = 'PR_OPENED',
+           ai_explanation = ?, pr_url = ?, updated_at = ?
+           WHERE id = ? AND after_status = 'PASS'""",
         (payload.get("explanation", ""), payload.get("pr_url", ""), datetime.utcnow().isoformat(), finding_id),
     )
+    if cursor.rowcount != 1:
+        db.rollback()
+        return jsonify({"error": "validated ticket not found"}), 404
     db.commit()
     finding = db.execute("SELECT build_id FROM findings WHERE id = ?", (finding_id,)).fetchone()
     log_event(finding["build_id"], finding_id, "ai_fix_pr_opened", payload.get("pr_url", ""))
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/tickets/<int:finding_id>/mark-pr-failed", methods=["POST"])
+def mark_pr_failed(finding_id):
+    """Record that validation passed but branch/PR publication did not complete."""
+    unauthorized = require_jenkins_callback()
+    if unauthorized:
+        return unauthorized
+    payload = request.get_json(force=True)
+    detail = str(payload.get("detail", "Branch or pull-request publication did not complete."))[:2000]
+    db = get_db()
+    cursor = db.execute(
+        """UPDATE findings SET status = 'ai_fix_validated', remediation_status = 'PR_CREATION_INCOMPLETE',
+           updated_at = ? WHERE id = ? AND after_status = 'PASS'""",
+        (datetime.utcnow().isoformat(), finding_id),
+    )
+    if cursor.rowcount != 1:
+        db.rollback()
+        return jsonify({"error": "validated ticket not found"}), 404
+    db.commit()
+    finding = db.execute("SELECT build_id FROM findings WHERE id = ?", (finding_id,)).fetchone()
+    log_event(finding["build_id"], finding_id, "ai_fix_pr_creation_incomplete", detail)
     return jsonify({"status": "ok"})
 
 

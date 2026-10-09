@@ -51,10 +51,10 @@ class DashboardEligibilityTests(unittest.TestCase):
              patch.object(dashboard_app, "DASHBOARD_CALLBACK_TOKEN", "callback-test-token"), \
              patch.object(dashboard_app, "trigger_jenkins_fix_job", return_value=(True, None)) as trigger:
             response = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
+            second = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["status"], "requested")
         trigger.assert_called_once()
-        second = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
         self.assertEqual(second.status_code, 409)
         trigger.assert_called_once()
 
@@ -195,6 +195,51 @@ class DashboardEligibilityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         ticket = next(item for item in self.client.get("/api/tickets").get_json() if item["id"] == ticket_id)
         self.assertEqual(ticket["after_status"], "PENDING")
+
+    def test_pr_publication_failure_is_authenticated_and_keeps_validation_evidence(self):
+        ticket_id = self.add_ticket("MEDIUM", source="trivy")
+        validation = self.client.post(
+            f"/api/tickets/{ticket_id}/validation-result",
+            json={"status": "PASS", "test_status": "PASS", "rescan_status": "PASS"},
+            headers={"Authorization": "Bearer callback-test-token"},
+        )
+        self.assertEqual(validation.status_code, 200)
+
+        unauthorized = self.client.post(
+            f"/api/tickets/{ticket_id}/mark-pr-failed", json={"detail": "push failed"},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+        response = self.client.post(
+            f"/api/tickets/{ticket_id}/mark-pr-failed",
+            json={"detail": "Git push did not complete"},
+            headers={"Authorization": "Bearer callback-test-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        ticket = next(item for item in self.client.get("/api/tickets").get_json() if item["id"] == ticket_id)
+        self.assertEqual(ticket["after_status"], "PASS")
+        self.assertEqual(ticket["remediation_status"], "PR_CREATION_INCOMPLETE")
+        self.assertEqual(ticket["status"], "ai_fix_validated")
+
+        with patch.object(dashboard_app, "JENKINS_USER", "test-user"), \
+             patch.object(dashboard_app, "JENKINS_API_TOKEN", "test-token"), \
+             patch.object(dashboard_app, "trigger_jenkins_fix_job", return_value=(True, None)) as trigger:
+            retry = self.client.post(f"/api/tickets/{ticket_id}/apply-ai-fix")
+        self.assertEqual(retry.status_code, 200)
+        trigger.assert_called_once()
+        with dashboard_app.app.app_context():
+            events = dashboard_app.get_db().execute(
+                "SELECT event FROM audit_log WHERE finding_id=? ORDER BY id", (ticket_id,),
+            ).fetchall()
+        self.assertIn("ai_fix_pr_retry_requested", [row["event"] for row in events])
+
+    def test_pr_publication_failure_cannot_replace_failed_validation(self):
+        ticket_id = self.add_ticket("MEDIUM", source="trivy")
+        response = self.client.post(
+            f"/api/tickets/{ticket_id}/mark-pr-failed",
+            json={"detail": "push failed"},
+            headers={"Authorization": "Bearer callback-test-token"},
+        )
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":
