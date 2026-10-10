@@ -9,7 +9,7 @@ function createApp() {
     // SAST (Semgrep) should flag string-concatenated queries.
     const query = "SELECT * FROM users WHERE id = '" + userId + "'";
 
-    res.send(`Would run query: ${query}`);
+    res.json({ message: `Would run query: ${query}` });
   });
 
   app.get('/health', (req, res) => {
