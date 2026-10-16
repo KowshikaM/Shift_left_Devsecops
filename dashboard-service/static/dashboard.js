@@ -54,6 +54,7 @@ async function renderPipelineStatus() {
   const gate = b.gate_status || "PENDING";
   const statusClass = status === "PASSED" ? "status-pass" : (status === "FAILED" ? "status-fail" : "status-running");
   const gateClass = gate === "PASS" ? "status-pass" : (gate === "FAIL" ? "status-fail" : "status-running");
+  const gateLabel = gate === "NOT_APPLICABLE" ? "Gate: Not run" : `Gate: ${gate}`;
   const jenkins = b.jenkins_url ? `<a href="${b.jenkins_url}" target="_blank" rel="noopener">Open Jenkins build</a>` : "";
   el.innerHTML = `
     <div class="pipeline-card">
@@ -64,7 +65,7 @@ async function renderPipelineStatus() {
       </div>
       <div class="pipeline-badges">
         <span class="pipeline-status ${statusClass}">${status}</span>
-        <span class="pipeline-status ${gateClass}">Gate: ${gate}</span>
+        <span class="pipeline-status ${gateClass}">${gateLabel}</span>
       </div>
     </div>`;
 }
@@ -99,7 +100,7 @@ async function renderTrend() {
   el.innerHTML = `<div class="trend-bars">` + trends.map(t => {
     const total = t.critical_count + t.high_count + t.medium_count + t.low_count;
     const heightPct = Math.max(4, (total / maxTotal) * 100);
-    const color = t.gate_status === "PASS" ? "var(--low)" : "var(--critical)";
+    const color = t.gate_status === "PASS" ? "var(--low)" : (t.gate_status === "FAIL" ? "var(--critical)" : "var(--medium)");
     return `<div class="trend-bar-wrap">
       <div class="trend-bar" style="height:${heightPct}%;background:${color}" title="Build #${t.build_number}: ${total} findings (${t.gate_status})"></div>
       <div class="trend-label">#${t.build_number}</div>
@@ -332,13 +333,13 @@ async function renderHistory() {
   list.innerHTML = builds.map(b => `
     <div class="build-row">
       <div class="build-left">
-        <span class="build-badge ${b.gate_status === "PASS" ? "pass" : "fail"}"></span>
+        <span class="build-badge ${b.gate_status === "PASS" ? "pass" : (b.gate_status === "FAIL" ? "fail" : "neutral")}"></span>
         <div>
           <div><strong>Build #${b.build_number}</strong> <span class="mono">${(b.commit_sha || "").slice(0, 8)}</span></div>
           <div class="ticket-meta">${b.branch || "main"} &middot; ${timeAgo(b.created_at)} ${b.deployed ? "&middot; deployed" : ""}</div>
         </div>
       </div>
-      <div class="ticket-meta">${b.total_count} finding(s) &middot; ${b.gate_status}</div>
+      <div class="ticket-meta">${b.total_count} finding(s) &middot; ${b.gate_status === "NOT_APPLICABLE" ? "Gate not run" : b.gate_status}</div>
     </div>
   `).join("");
 }

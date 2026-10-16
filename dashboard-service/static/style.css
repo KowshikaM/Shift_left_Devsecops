@@ -110,6 +110,7 @@ tbody tr:hover { background: #FAFBFC; }
 .build-badge { width: 8px; height: 8px; border-radius: 50%; }
 .build-badge.pass { background: var(--low); }
 .build-badge.fail { background: var(--critical); }
+.build-badge.neutral { background: var(--medium); }
 
 .audit-row { padding: 0.7rem 0; border-bottom: 1px solid var(--border); font-size: 0.84rem; }
 .audit-row:last-child { border-bottom: none; }

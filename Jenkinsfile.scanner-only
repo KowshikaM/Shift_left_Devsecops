@@ -1,0 +1,120 @@
+// Manually triggered lifecycle test. Configure this job's SCM branch as
+// */e2e-finding-lifecycle-test and leave every Build Trigger unchecked.
+pipeline {
+    agent any
+
+    environment {
+        DASHBOARD_URL       = 'http://localhost:2001'
+        DASHBOARD_API_PATH  = '/api/scanner-builds'
+        PUBLISH_FINDINGS    = '1'
+        PUBLISH_SCANNERS    = 'semgrep'
+        PUBLISH_REQUIRED    = '1'
+        GATE_STATUS         = 'NOT_APPLICABLE'
+        PIPELINE_STATUS     = 'RUNNING'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout test branch') {
+            steps {
+                checkout scm
+
+                script {
+                    def commit = powershell(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    def remoteBranches = powershell(
+                        returnStdout: true,
+                        script: 'git branch -r --contains HEAD'
+                    ).readLines().collect { it.trim() }
+
+                    if (!remoteBranches.contains('origin/e2e-finding-lifecycle-test')) {
+                        error('Checkout is not a commit on origin/e2e-finding-lifecycle-test.')
+                    }
+
+                    env.GIT_COMMIT = commit
+                    env.GIT_BRANCH = 'origin/e2e-finding-lifecycle-test'
+                    env.DASHBOARD_BUILD_NUMBER = "semgrep-test-${env.BUILD_NUMBER}"
+                }
+
+                powershell '''
+                    Remove-Item "semgrep-results.json" -Force -ErrorAction SilentlyContinue
+                '''
+            }
+        }
+
+        stage('Semgrep scan app') {
+            steps {
+                script {
+                    env.PIPELINE_STAGE = 'Semgrep scanner-only test'
+                    env.PIPELINE_STATUS = 'RUNNING'
+                }
+
+                powershell '''
+                    & docker run --rm `
+                      -v "${env:WORKSPACE}:/src" `
+                      returntocorp/semgrep:1.176.0 `
+                      semgrep scan `
+                      --config p/owasp-top-ten `
+                      --config p/javascript `
+                      --json `
+                      --output /src/semgrep-results.json `
+                      /src/app
+
+                    $scanCode = $LASTEXITCODE
+                    if ($scanCode -ge 2) {
+                        throw "Semgrep execution failed with exit code $scanCode."
+                    }
+                    if (!(Test-Path "semgrep-results.json")) {
+                        throw "Semgrep did not create semgrep-results.json."
+                    }
+
+                    try {
+                        $report = Get-Content "semgrep-results.json" -Raw | ConvertFrom-Json -ErrorAction Stop
+                    }
+                    catch {
+                        throw "Semgrep report is not valid JSON: $($_.Exception.Message)"
+                    }
+                    if ($null -eq $report.results -or $report.results -isnot [array]) {
+                        throw "Semgrep report has no results array."
+                    }
+                    if (@($report.errors).Count -gt 0) {
+                        throw "Semgrep report contains scanner errors."
+                    }
+                '''
+
+                script {
+                    env.PIPELINE_STAGE = 'Semgrep scan complete'
+                    env.PIPELINE_STATUS = 'PASSED'
+                }
+            }
+        }
+
+        stage('Publish scanner-only findings') {
+            steps {
+                script {
+                    env.PIPELINE_STAGE = 'Publishing Semgrep-only findings'
+                }
+
+                withCredentials([
+                    string(credentialsId: 'dashboard-ingest-token', variable: 'DASHBOARD_INGEST_TOKEN')
+                ]) {
+                    powershell '''
+                        python scripts/publish_to_dashboard.py
+                        if ($LASTEXITCODE -ne 0) {
+                            exit $LASTEXITCODE
+                        }
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Scanner-only build result: ${currentBuild.result ?: 'UNKNOWN'}"
+        }
+    }
+}

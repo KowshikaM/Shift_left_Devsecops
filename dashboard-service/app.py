@@ -33,6 +33,7 @@ JENKINS_USER = os.environ.get("JENKINS_USER", "")
 JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN", "")
 JENKINS_FIX_JOB = os.environ.get("JENKINS_FIX_JOB", "ai-single-fix")
 DASHBOARD_CALLBACK_TOKEN = os.environ.get("DASHBOARD_CALLBACK_TOKEN", "")
+DASHBOARD_INGEST_TOKEN = os.environ.get("DASHBOARD_INGEST_TOKEN", "")
 
 app = Flask(__name__, static_folder="static")
 
@@ -128,7 +129,40 @@ def sqlite_text(value):
 @app.route("/api/builds", methods=["POST"])
 def create_build():
     payload = request.get_json(force=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "build payload must be a JSON object"}), 400
+    return persist_build(payload)
 
+
+@app.route("/api/scanner-builds", methods=["POST"])
+def create_scanner_build():
+    if not DASHBOARD_INGEST_TOKEN:
+        return jsonify({"error": "scanner ingestion is not configured"}), 503
+
+    supplied = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not supplied.startswith(prefix) or not hmac.compare_digest(
+        supplied[len(prefix):], DASHBOARD_INGEST_TOKEN
+    ):
+        return jsonify({"error": "unauthorized scanner ingestion"}), 401
+
+    payload = request.get_json(force=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "build payload must be a JSON object"}), 400
+    if payload.get("findings_complete") is not True or payload.get("scan_scope") != ["semgrep"]:
+        return jsonify({"error": "a complete Semgrep-only scan is required"}), 400
+    if not all(str(payload.get(key, "")).strip() for key in ("build_number", "commit_sha", "branch")):
+        return jsonify({"error": "build number, commit SHA, and branch are required"}), 400
+    findings = payload.get("findings")
+    if not isinstance(findings, list) or any(
+        not isinstance(finding, dict) or str(finding.get("source", "")).lower() != "semgrep"
+        for finding in findings
+    ):
+        return jsonify({"error": "scanner-only ingestion accepts Semgrep findings only"}), 400
+    return persist_build(payload)
+
+
+def persist_build(payload):
     db = get_db()
     findings = payload.get("findings", []) or []
     findings_complete = bool(payload.get("findings_complete", False))
