@@ -9,8 +9,8 @@ pipeline {
         PUBLISH_FINDINGS    = '1'
         PUBLISH_SCANNERS    = 'semgrep'
         PUBLISH_REQUIRED    = '1'
-        GATE_STATUS         = 'NOT_APPLICABLE'
-        PIPELINE_STATUS     = 'RUNNING'
+        DASHBOARD_GATE_STATUS     = 'NOT_APPLICABLE'
+        DASHBOARD_PIPELINE_STATUS = 'PASSED'
     }
 
     options {

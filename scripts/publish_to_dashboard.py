@@ -120,8 +120,10 @@ def main():
         "commit_sha": os.environ.get("GIT_COMMIT", ""),
         "branch": os.environ.get("GIT_BRANCH", "main"),
         "triggered_by": os.environ.get("BUILD_USER", "jenkins"),
-        "gate_status": read_gate_status(),
-        "pipeline_status": os.environ.get("PIPELINE_STATUS", "RUNNING"),
+        "gate_status": os.environ.get("DASHBOARD_GATE_STATUS") or read_gate_status(),
+        "pipeline_status": os.environ.get(
+            "DASHBOARD_PIPELINE_STATUS", os.environ.get("PIPELINE_STATUS", "RUNNING")
+        ),
         "current_stage": os.environ.get("PIPELINE_STAGE", ""),
         "jenkins_url": os.environ.get("BUILD_URL", ""),
         "deployed": os.environ.get("DEPLOYED", "0") == "1",
@@ -143,11 +145,16 @@ def main():
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             print(f"[publish] Dashboard build id={result.get('build_id')} stage={payload['current_stage']} status={payload['pipeline_status']} gate={payload['gate_status']}")
-    except urllib.error.URLError as e:
-        print(f"[publish] Could not reach dashboard-service at {DASHBOARD_URL}: {e}")
-        print("[publish] Dashboard update skipped; pipeline continues.")
+    except urllib.error.HTTPError as e:
+        print(f"[publish] Dashboard rejected update: HTTP {e.code} {e.reason}")
         if os.environ.get("PUBLISH_REQUIRED", "0") == "1":
             raise SystemExit(1) from e
+        print("[publish] Dashboard update skipped; pipeline continues.")
+    except urllib.error.URLError as e:
+        print(f"[publish] Could not reach dashboard-service at {DASHBOARD_URL}: {e}")
+        if os.environ.get("PUBLISH_REQUIRED", "0") == "1":
+            raise SystemExit(1) from e
+        print("[publish] Dashboard update skipped; pipeline continues.")
 
 
 if __name__ == "__main__":

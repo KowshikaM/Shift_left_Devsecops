@@ -567,8 +567,13 @@ pipeline {
 
     post {
         always {
-            echo "Gate status: ${env.GATE_STATUS}"
-            echo "Build result: ${currentBuild.result ?: 'UNKNOWN'}"
+            script {
+                def reportedGate = fileExists('gate-status.txt')
+                    ? readFile('gate-status.txt').trim().toUpperCase()
+                    : 'MISSING'
+                echo "Gate status: ${reportedGate}"
+                echo "Build result: ${currentBuild.result ?: 'UNKNOWN'}"
+            }
         }
 
         failure {
